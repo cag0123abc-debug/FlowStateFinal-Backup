@@ -667,10 +667,12 @@ function viewSettings(){
     <label>Style <select onchange="setS('anim',this.value)">${Object.entries(ANIMS).map(([k,l])=>`<option value="${k}" ${(s.anim||'bubbles')===k?'selected':''}>${l}</option>`).join('')}</select></label>
     <label>Speed <input type="range" min="0" max="3" step="0.1" value="${s.speed}" onchange="setS('speed',+this.value)"></label>
     <label><input type="checkbox" ${s.reduce?'checked':''} onchange="setS('reduce',this.checked)"> Reduce motion (stops the blobs)</label></div>
-  <div class="panel"><h3>Google integration</h3>
-    <p class="empty">${D.settings.googleSync?'Google sync is enabled on this device.':'Connect FlowState to send your items to Google Calendar and receive scheduled Gmail reminders.'}</p>
-    <div class="row">${D.settings.googleSync?'<button class="primary" onclick="connectGoogleSync()">Sync all items now</button><button onclick="testGoogleSync()">Send test email</button><button onclick="disconnectGoogleSync()">Pause sync</button>':'<button class="primary" onclick="connectGoogleSync()">Connect Google &amp; sync items</button>'}</div>
-    <small>Only items created or changed on this device are sent. Keep this app connected to the internet when making changes. Calendar and email delivery are handled by your Google Apps Script.</small>
+  <div class="panel"><h3>Google Calendar sync</h3>
+    <p class="empty">${gsReady()?'Connected to your own sync endpoint.':'Add the Apps Script web app URL you deployed from your own Google account. No endpoint or key is built into this app.'}</p>
+    <label>Sync URL <input id="f-gsurl" value="${esc(gsUrl())}" placeholder="https://script.google.com/macros/s/…/exec" title="Your Apps Script web app URL"></label>
+    <label>Device key <input id="f-gskey" type="password" value="${esc(gsKey())}" placeholder="Private key set in your script" title="Stored only on this device"></label>
+    <div class="row"><button onclick="saveSyncSettings()" title="Keep these on this device">Save</button>${D.settings.googleSync?'<button class="primary" onclick="connectGoogleSync()" title="Push everything, then pull changes">Sync all items</button><button onclick="pullGoogleSync()" title="Bring Google Calendar events in">Pull from Google</button><button onclick="testGoogleSync()">Send test</button><button onclick="disconnectGoogleSync()">Pause</button>':'<button class="primary" onclick="connectGoogleSync()" title="Push everything, then pull changes">Connect &amp; sync</button>'}</div>
+    <small>Events you create sync out. Events you add in Google Calendar sync in and are tagged 📅 Google. Matching uses the Google event id, so nothing is duplicated. If you ever used a built-in endpoint from an older version, delete that deployment in Apps Script and generate a new key.</small>
   </div>
   <div class="panel"><h3>Backup</h3><div class="row"><button onclick="exportData()">Export data</button><button onclick="importData()">Import data</button></div></div>
   <div class="panel"><h3>Classes</h3>${D.classes.map(c=>`<div class="card"><div class="grow">${esc(c.icon)} ${esc(c.name)}</div><button onclick="editClass('${c.id}')">Edit</button> <button class="danger" onclick="delClass('${c.id}')">Delete</button></div>`).join('')}
@@ -1021,13 +1023,16 @@ function confirmSheet(msg,fn){CONF=fn;sheet(`<p>${esc(msg)}</p><div class="row">
 
 function openDetail(id){
   const i=D.items.find(x=>x.id===id);if(!i)return;
-  sheet(`<small>${esc(LABEL[i.type]||'')}${i.cat?' · '+CATS[i.cat]:''}${i.cls?' · '+esc(clsName(i.cls)):''}</small>
+  const rec=recActive(i);
+  sheet(`<small>${esc(LABEL[i.type]||'')}${i.cat?' · '+CATS[i.cat]:''}${i.cls?' · '+esc(clsName(i.cls)):''}${i.source==='google'?' · 📅 '+esc(i.gcalCal||'Google Calendar'):''}</small>
   <h2>${esc(i.title)}</h2>
   ${i.due?`<p>Due ${esc(fmt(i.due))}</p>`:''}
+  ${rec?`<p>🔁 ${esc(recSummary(i))}</p>`:''}
   ${i.reminders&&i.reminders.length?`<p>Reminders: ${i.reminders.join(', ')} min before</p>`:''}
   ${i.duration?`<p>Length: ${fmtDur(i.duration*1000)}</p>`:''}
   ${bodyHtml(i.body,'dt-'+i.id)}
-  <div class="row">${i.type==='recording'?'':`<button onclick="openForm(null,'${id}')">Edit</button>`}${i.due?`<button onclick="icsFor('${id}')">Calendar file</button>`:''}<button class="danger" onclick="delItem('${id}')">Delete</button><button onclick="closeSheet()">Close</button></div>`);
+  <div class="row">${i.type==='recording'?'':`<button onclick="openForm(null,'${id}')">Edit</button>`}${i.due?`<button onclick="icsFor('${id}')">Calendar file</button>`:''}<button onclick="saveAsTemplate('${id}')" title="Reuse this as a routine">Save as template</button><button class="danger" onclick="delItem('${id}')">Delete</button><button onclick="closeSheet()">Close</button></div>
+  ${rec?`<div class="row"><button onclick="editOccurrence('${id}')" title="Change only one date, leaving the rest of the series">Edit one occurrence</button><button onclick="skipThis('${id}')" title="Skip one date but keep the series">Skip next</button><button class="danger" onclick="delSeries('${id}')" title="Delete every occurrence">Delete series</button></div>`:''}`);
 }
 function delItem(id){
   const i=D.items.findIndex(x=>x.id===id);if(i<0)return;
@@ -1036,6 +1041,40 @@ function delItem(id){
   toast('Deleted "'+it.title+'"',()=>{D.items.splice(i,0,it);save();sendGoogleSync('upsert',it);render()});
 }
 function toggleDone(id){const i=D.items.find(x=>x.id===id);if(i){i.done=!i.done;save();sendGoogleSync('upsert',i);render()}}
+
+/* ================= recurring series editing ================= */
+function nextOccDate(i){
+  if(S.sel&&occursOnDate(i,S.sel))return S.sel;
+  const t=new Date();
+  for(let k=0;k<400;k++){const x=new Date(t);x.setDate(t.getDate()+k);if(occursOnDate(i,x))return dk(x)}
+  return null;
+}
+function skipThis(id){
+  const i=D.items.find(x=>x.id===id);if(!i||!recActive(i))return;
+  const d=nextOccDate(i);if(!d)return toast('No upcoming occurrence found');
+  skipOccurrence(id,d);closeSheet();render();toast('Skipped '+fmt(d)+' — the series continues');
+}
+function delSeries(id){
+  const i=D.items.find(x=>x.id===id);if(!i)return;
+  D.items=D.items.filter(x=>x.id!==id);save();sendGoogleSync('delete',null,id);closeSheet();render();
+  toast('Series deleted');
+}
+function editOccurrence(id){
+  const i=D.items.find(x=>x.id===id);if(!i||!recActive(i))return;
+  const d=nextOccDate(i);if(!d)return toast('No upcoming occurrence found');
+  const o=occAt(i,d);
+  skipOccurrence(id,d);
+  const copy=JSON.parse(JSON.stringify(i));
+  copy.id=uid();copy.recurrence=null;copy.exceptions=[];copy.gcalId=null;copy.source='local';
+  copy.due=dk(o)+'T'+String(o.getHours()).padStart(2,'0')+':'+String(o.getMinutes()).padStart(2,'0');
+  D.items.push(copy);save();closeSheet();openForm(null,copy.id);
+  toast('Editing just this occurrence');
+}
+function saveSyncSettings(){
+  D.settings.gsUrl=val('gsurl').trim();
+  D.settings.gsKey=val('gskey').trim();
+  save();render();toast('Sync settings saved on this device');
+}
 
 function openRec(){
   if(REC)return showRec();
