@@ -674,6 +674,12 @@ function viewSettings(){
     <div class="row"><button onclick="saveSyncSettings()" title="Keep these on this device">Save</button>${D.settings.googleSync?'<button class="primary" onclick="connectGoogleSync()" title="Push everything, then pull changes">Sync all items</button><button onclick="pullGoogleSync()" title="Bring Google Calendar events in">Pull from Google</button><button onclick="testGoogleSync()">Send test</button><button onclick="disconnectGoogleSync()">Pause</button>':'<button class="primary" onclick="connectGoogleSync()" title="Push everything, then pull changes">Connect &amp; sync</button>'}</div>
     <small>Events you create sync out. Events you add in Google Calendar sync in and are tagged 📅 Google. Matching uses the Google event id, so nothing is duplicated. If you ever used a built-in endpoint from an older version, delete that deployment in Apps Script and generate a new key.</small>
   </div>
+  <div class="panel"><h3>AI transcript summaries</h3>
+    <p class="empty">Optional. Point this at your own summarization endpoint. The key is stored on this device only and is never written into the app.</p>
+    <label>Endpoint <input id="f-aiurl" value="${esc(D.settings.aiUrl||'')}" placeholder="https://your-endpoint" title="Your summarization endpoint"></label>
+    <label>Key <input id="f-aikey" type="password" value="${esc(D.settings.aiKey||'')}" placeholder="Stored only on this device" title="Your API key"></label>
+    <div class="row"><button onclick="saveAiSettings()" title="Save on this device">Save</button></div>
+  </div>
   <div class="panel"><h3>Backup</h3><div class="row"><button onclick="exportData()">Export data</button><button onclick="importData()">Import data</button></div></div>
   <div class="panel"><h3>Classes</h3>${D.classes.map(c=>`<div class="card"><div class="grow">${esc(c.icon)} ${esc(c.name)}</div><button onclick="editClass('${c.id}')">Edit</button> <button class="danger" onclick="delClass('${c.id}')">Delete</button></div>`).join('')}
     <button class="primary" onclick="openForm('class')">+ Add class</button></div>`;
@@ -1031,7 +1037,8 @@ function openDetail(id){
   ${i.reminders&&i.reminders.length?`<p>Reminders: ${i.reminders.join(', ')} min before</p>`:''}
   ${i.duration?`<p>Length: ${fmtDur(i.duration*1000)}</p>`:''}
   ${bodyHtml(i.body,'dt-'+i.id)}
-  <div class="row">${i.type==='recording'?'':`<button onclick="openForm(null,'${id}')">Edit</button>`}${i.due?`<button onclick="icsFor('${id}')">Calendar file</button>`:''}<button onclick="saveAsTemplate('${id}')" title="Reuse this as a routine">Save as template</button><button class="danger" onclick="delItem('${id}')">Delete</button><button onclick="closeSheet()">Close</button></div>
+  ${i.audio&&i.audio.url?`<audio controls preload="metadata" src="${esc(i.audio.url)}" style="width:100%;margin:8px 0"></audio>`:''}
+  <div class="row">${i.type==='recording'?`<button onclick="summarizeRecording('${id}')" title="Summarize the transcript and pull out tasks">Summarize</button>`:`<button onclick="openForm(null,'${id}')">Edit</button>`}${i.due?`<button onclick="icsFor('${id}')">Calendar file</button>`:''}<button onclick="saveAsTemplate('${id}')" title="Reuse this as a routine">Save as template</button><button class="danger" onclick="delItem('${id}')">Delete</button><button onclick="closeSheet()">Close</button></div>
   ${rec?`<div class="row"><button onclick="editOccurrence('${id}')" title="Change only one date, leaving the rest of the series">Edit one occurrence</button><button onclick="skipThis('${id}')" title="Skip one date but keep the series">Skip next</button><button class="danger" onclick="delSeries('${id}')" title="Delete every occurrence">Delete series</button></div>`:''}`);
 }
 function delItem(id){
@@ -1262,7 +1269,62 @@ function frame(){
 }
 
 window.addEventListener('resize',resize);
-resize();rail_init();clock();render();tick();flushGoogleSync();
+/* ================= shared recordings from Android ================= */
+function androidBridge(){return (typeof FlowStateAndroid!=='undefined')?FlowStateAndroid:null}
+function checkSharedImports(){
+  const b=androidBridge();if(!b||!b.pendingImports)return;
+  let list=[];
+  try{list=JSON.parse(b.pendingImports()||'[]')}catch(e){return}
+  if(!list||!list.length)return;
+  importSheet(list);
+}
+function importSheet(list){
+  window.__pendingImports=list;
+  sheet('<h2>Import shared items</h2><p class="empty">These were copied into FlowState storage, so they stay available after the sharing app closes.</p>'+
+    list.map(f=>'<div class="card"><div class="grow"><b>'+esc(f.name||'Shared item')+'</b><small>'+esc(f.mime||'file')+' · '+Math.max(1,Math.round((f.size||0)/1024))+' KB</small>'+(f.text?'<small>'+esc(String(f.text).slice(0,160))+'…</small>':'')+'</div></div>').join('')+
+    '<label>Put them in <select id="f-impcat" title="Category for these recordings">'+Object.keys(CATS).map(k=>'<option value="'+k+'"'+(k==='personal'?' selected':'')+'>'+esc(CATS[k])+'</option>').join('')+'</select></label>'+
+    '<div class="row"><button class="primary" onclick="doImport()" title="Save into FlowState">Import</button><button onclick="dismissImports()" title="Discard these files">Discard</button></div>');
+}
+function doImport(){
+  const b=androidBridge();const list=window.__pendingImports||[];if(!list.length)return closeSheet();
+  const cat=val('impcat')||'personal';
+  list.forEach(function(f){
+    D.items.push({id:uid(),type:'recording',cat:cat,cls:null,title:f.name||'Recording',body:f.text||'',due:null,list:null,priority:'normal',reminders:[],done:false,created:Date.now(),source:'share',audio:{url:f.url||'',name:f.name||'',mime:f.mime||'',size:f.size||0}});
+    if(b&&b.clearPending)b.clearPending(f.id);
+  });
+  window.__pendingImports=[];save();closeSheet();render();
+  toast(list.length+' item'+(list.length===1?'':'s')+' imported');
+}
+function dismissImports(){
+  const b=androidBridge();(window.__pendingImports||[]).forEach(function(f){if(b&&b.clearPending)b.clearPending(f.id)});
+  window.__pendingImports=[];closeSheet();
+}
+function saveAiSettings(){
+  D.settings.aiUrl=val('aiurl').trim();D.settings.aiKey=val('aikey').trim();
+  save();render();toast('AI settings saved on this device');
+}
+function summarizeRecording(id){
+  const i=D.items.find(x=>x.id===id);if(!i)return;
+  const url=String(D.settings.aiUrl||'').trim(),key=String(D.settings.aiKey||'').trim();
+  if(!url)return toast('Add an AI endpoint in Settings first');
+  if(!i.body)return toast('This recording has no transcript text to summarize');
+  toast('Summarizing…');
+  fetch(url,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+key},body:JSON.stringify({text:i.body,title:i.title})})
+    .then(r=>r.json())
+    .then(function(j){
+      const s=j.summary||j.text||'';
+      const tasks=j.tasks||[];
+      i.body=(i.body?i.body+'\n\n':'')+'— Summary —\n'+s;
+      (tasks||[]).forEach(function(t){
+        D.items.push({id:uid(),type:'homework',cat:i.cat,cls:i.cls,title:(t.title||String(t)),body:'',due:t.due||null,list:null,priority:'normal',reminders:[],done:false,created:Date.now(),source:'ai'});
+      });
+      save();closeSheet();render();
+      toast('Summary saved'+(tasks.length?' · '+tasks.length+' task'+(tasks.length===1?'':'s')+' added':''));
+    })
+    .catch(function(){toast('Could not reach the AI endpoint')});
+}
+
+resize();rail_init();clock();render();tick();flushGoogleSync();checkSharedImports();
 setInterval(tick,15000);setInterval(clock,1000);
 requestAnimationFrame(frame);
 </script>
