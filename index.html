@@ -353,54 +353,85 @@ function openDayAdd(type,rem){
   openForm(type,null,pre);
   if(rem)setTimeout(()=>{document.querySelectorAll('.rem').forEach(c=>{if(c.value==='10')c.checked=true})},0);
 }
-
-// Google sync uses the user's Apps Script web app. Requests are sent as
-// text/plain so the endpoint can accept them without a browser CORS preflight.
-const GOOGLE_SYNC_URL='https://script.google.com/macros/s/AKfycbxF-v0PypnUbO-h9mPWKc5E8LIjJUe2WosWHY2C-Le2j4lpYwtdY1EBE06u0Dh64vP4Yw/exec';
-const GOOGLE_SYNC_TOKEN='flowstate-2026-private-7Kq9m2';
+// Google sync talks to the user's own Apps Script web app. The endpoint and
+// the device key are entered in Settings and stored on this device only.
+// No secret is shipped in this file or served publicly.
+function gsUrl(){return String(D.settings.gsUrl||'').trim()}
+function gsKey(){return String(D.settings.gsKey||'').trim()}
+function gsReady(){return !!gsUrl()}
 function googlePayload(action,item,id){
-  const payload={token:GOOGLE_SYNC_TOKEN,action};
+  const payload={key:gsKey(),action};
   if(item){
     const copy={...item};
     // Send an unambiguous instant to Apps Script while keeping the local
     // date-time value untouched in FlowState's own storage.
     if(copy.due){const d=new Date(copy.due);copy.due=isNaN(d)?null:d.toISOString()}
+    copy.recurrence=item.recurrence||null;
+    copy.exceptions=item.exceptions||[];
     payload.item=copy;
   }
   if(id)payload.id=id;
   return JSON.stringify(payload);
 }
+function gsQueue(body){
+  D.settings.pendingGoogleSync=D.settings.pendingGoogleSync||[];
+  D.settings.pendingGoogleSync.push(body);save();
+}
 function sendGoogleSync(action,item,id){
-  if(!D.settings.googleSync)return;
+  if(!D.settings.googleSync||!gsReady())return;
   const body=googlePayload(action,item,id);
-  if(!navigator.onLine){
-    D.settings.pendingGoogleSync=D.settings.pendingGoogleSync||[];
-    D.settings.pendingGoogleSync.push(body);save();return;
-  }
-  fetch(GOOGLE_SYNC_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=UTF-8'},body,keepalive:true})
-    .catch(()=>{D.settings.pendingGoogleSync=D.settings.pendingGoogleSync||[];D.settings.pendingGoogleSync.push(body);save()});
+  if(!navigator.onLine){gsQueue(body);return}
+  fetch(gsUrl(),{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=UTF-8'},body,keepalive:true})
+    .catch(()=>gsQueue(body));
 }
 function flushGoogleSync(){
-  if(!D.settings.googleSync||!navigator.onLine)return;
+  if(!D.settings.googleSync||!navigator.onLine||!gsReady())return;
   const q=D.settings.pendingGoogleSync||[];if(!q.length)return;
   D.settings.pendingGoogleSync=[];save();
-  q.forEach(body=>fetch(GOOGLE_SYNC_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=UTF-8'},body,keepalive:true}).catch(()=>{D.settings.pendingGoogleSync=D.settings.pendingGoogleSync||[];D.settings.pendingGoogleSync.push(body);save()}));
+  q.forEach(body=>fetch(gsUrl(),{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=UTF-8'},body,keepalive:true}).catch(()=>gsQueue(body)));
+}
+// Incoming direction: read events back from the calendar and merge them.
+// Matching is by Google event id, so the same event never lands twice.
+async function pullGoogleSync(silent){
+  if(!gsReady()){if(!silent)toast('Add your sync URL in Settings first');return}
+  try{
+    const r=await fetch(gsUrl()+'?action=pull&key='+encodeURIComponent(gsKey()),{method:'GET',cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const data=await r.json();
+    if(data.error)throw new Error(data.error);
+    const evs=data.events||[];let added=0,updated=0;
+    evs.forEach(ev=>{
+      const gid=ev.gcalId||ev.id;if(!gid)return;
+      const ex=D.items.find(i=>i.gcalId===gid);
+      const fields={title:ev.title||'Untitled',body:ev.body||'',due:ev.due||null,type:ev.type||'event',cat:ev.cat||'personal',cls:ev.cls||null,recurrence:ev.recurrence||null,source:'google',gcalId:gid,gcalCal:ev.calendar||'Google',exceptions:ev.exceptions||[]};
+      if(ex){Object.assign(ex,fields);updated++}
+      else{D.items.push(Object.assign({id:uid(),priority:'normal',reminders:[],done:false,created:Date.now(),list:null},fields));added++}
+    });
+    D.settings.lastPull=Date.now();save();
+    if(added||updated)render();
+    if(!silent)toast('Google → FlowState: '+added+' new, '+updated+' updated');
+  }catch(e){if(!silent)toast('Pull failed: '+e.message)}
 }
 function connectGoogleSync(){
+  if(!gsReady()){toast('Add your sync URL in Settings first');return}
   D.settings.googleSync=true;save();
   const pending=D.items.slice();
   pending.forEach(item=>sendGoogleSync('upsert',item));
   render();toast('Google sync requests sent for '+pending.length+' items');
+  pullGoogleSync(true);
 }
 function disconnectGoogleSync(){
   D.settings.googleSync=false;save();render();toast('Automatic Google sync paused');
 }
 function testGoogleSync(){
-  if(!D.settings.googleSync){toast('Connect Google sync first');return}
-  const body=JSON.stringify({token:GOOGLE_SYNC_TOKEN,action:'test'});
-  fetch(GOOGLE_SYNC_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=UTF-8'},body,keepalive:true})
-    .then(()=>toast('Test request sent. Check your Gmail inbox for the FlowState test email.'))
+  if(!gsReady()){toast('Add your sync URL in Settings first');return}
+  const body=JSON.stringify({key:gsKey(),action:'test'});
+  fetch(gsUrl(),{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=UTF-8'},body,keepalive:true})
+    .then(()=>toast('Test request sent. Check your Google account for the FlowState test event.'))
     .catch(()=>toast('Could not send the test request. Check your connection.'));
+}
+function setSync(field,value){
+  D.settings[field]=value;save();
 }
 window.addEventListener('online',flushGoogleSync);
 function clsName(id){const c=D.classes.find(x=>x.id===id);return c?c.name:''}
