@@ -143,6 +143,12 @@ label.chip{display:inline-flex;align-items:center;gap:4px;width:auto;padding:6px
 .book .reorder button{width:34px;height:34px;padding:0;border-radius:50%;font-size:15px;background:rgba(255,255,255,.92);border:2px solid rgba(0,0,0,.35);line-height:1}
 /* ---- in-app browser ---- */
 .brw{display:flex;flex-direction:column;gap:10px;height:100%}
+/* ---- decorative widget ---- */
+.widget{position:relative;border-radius:18px;overflow:hidden;margin:0 0 16px;background:var(--card);box-shadow:0 6px 18px rgba(0,0,0,.22);display:flex;align-items:center;justify-content:center;width:100%}
+.widget img{width:100%;height:100%;object-fit:cover;display:block}
+.widget .wq{padding:22px;font-size:1.15em;line-height:1.55;font-style:italic;text-align:center}
+.widget .wlab{position:absolute;left:12px;bottom:10px;font-size:.72em;background:rgba(0,0,0,.5);color:#fff;padding:2px 9px;border-radius:10px}
+.widget .wref{position:absolute;right:10px;top:10px;width:34px;height:34px;padding:0;border-radius:50%;background:rgba(0,0,0,.5);color:#fff;border:0;font-size:16px;line-height:1}
 .brwbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .brwbar button{width:46px;height:46px;padding:0;font-size:20px;border-radius:50%;flex:none}
 .brwbar input{flex:1;min-width:180px;margin:0}
@@ -186,6 +192,8 @@ body.focusmode .sticky{display:none}
         <button onclick="openSearch()" title="Search">🔍</button>
         <button onclick="openSearch()" title="Search everything">🔎</button>
       <button onclick="go2('focus')" title="Focus mode">🎯</button>
+      <button onclick="lookSheet()" title="Look, widgets and image library">🎨</button>
+      <button onclick="quickAdd()" title="Quick add event, task, note or reminder">➕</button>
       <button onclick="go2('notifs')" title="Notifications">🔔<i id="badge"></i></button>
         <button onclick="go2('settings')" title="Settings">⚙️</button>
       </div>
@@ -473,6 +481,7 @@ function render(){
   const t=S.tab,v=$('#view');
   v.className=S.enter?'enter':'';S.enter=false;
   v.innerHTML=t==='home'?viewHome():t==='school'?(S.cls?viewClass(S.cls):viewClassSelect()):t==='personal'?viewPersonal():t==='notifs'?viewNotifs():t==='settings'?viewSettings():t==='browser'?viewBrowser():t==='focus'?viewFocus():viewCat(t);
+  if(t!=='settings'&&t!=='notifs'&&t!=='browser'&&t!=='focus'){const w=widgetHtml();if(w)v.insertAdjacentHTML('afterbegin',w)}
   bind(v);
   $('#schoolBtn').classList.toggle('on',t==='school'&&!!S.cls);
   if(t==='school'&&!S.cls&&S.bubble)showBubble();else hideBubble();
@@ -668,6 +677,214 @@ function viewSettings(){
     <button class="primary" onclick="openForm('class')">+ Add class</button></div>`;
 }
 function setS(k,v){const s=D.settings;if(k.startsWith('bg.'))s.bg[k.slice(3)]=v;else s[k]=v;save();render()}
+
+/* ================= recurrence form helpers ================= */
+function recUI(){
+  const f=$('#r-freq');if(!f)return;
+  const v=f.value;
+  if($('#r-week'))$('#r-week').style.display=v==='weekly'?'':'none';
+  if($('#r-month'))$('#r-month').style.display=v==='monthly'?'':'none';
+  const mm=$('#r-mmode');
+  if($('#r-nth'))$('#r-nth').style.display=(v==='monthly'&&mm&&mm.value==='nth')?'':'none';
+}
+function readRecurrence(){
+  const f=$('#r-freq');if(!f)return null;
+  const freq=f.value;if(freq==='none')return null;
+  const r={freq:freq,interval:Math.max(1,parseInt(val('r-int'),10)||1),until:val('r-until')||null,count:parseInt(val('r-count'),10)||0};
+  if(freq==='weekly')r.weekdays=[...document.querySelectorAll('.r-wd')].filter(x=>x.checked).map(x=>+x.value);
+  if(freq==='monthly'){
+    r.monthlyMode=val('r-mmode')||'day';
+    if(r.monthlyMode==='nth'){r.nth=parseInt(val('r-n'),10)||1;r.nthWeekday=parseInt(val('r-nwd'),10)||0}
+  }
+  return r;
+}
+
+/* ================= schedule templates ================= */
+function saveAsTemplate(id){
+  const i=D.items.find(x=>x.id===id);if(!i)return;
+  D.templates=D.templates||[];
+  D.templates.push({id:uid(),name:i.title,type:i.type,cat:i.cat,cls:i.cls,body:i.body||'',recurrence:i.recurrence?JSON.parse(JSON.stringify(i.recurrence)):null,priority:i.priority,reminders:(i.reminders||[]).slice()});
+  save();closeSheet();toast('Saved as a schedule template');
+}
+function templateSheet(){
+  const t=D.templates||[];
+  sheet('<h2>Schedule templates</h2><p class="empty">Reusable routines for work, school and everything else.</p>'+
+    (t.length?t.map(x=>'<div class="card"><div class="grow"><b>'+esc(x.name)+'</b><small>'+esc(recSummary(x)||LABEL[x.type]||'Template')+(x.cls?' · '+esc(clsName(x.cls)):'')+'</small></div><button onclick="useTemplate(\''+x.id+'\')" title="Create an item from this template">Use</button><button class="danger" onclick="delTemplate(\''+x.id+'\')" title="Delete template">✕</button></div>').join(''):'<p class="empty">No templates yet. Open an event or task and choose “Save as template”.</p>'));
+}
+function useTemplate(id){
+  const t=(D.templates||[]).find(x=>x.id===id);if(!t)return;
+  openForm(t.type);
+  setTimeout(function(){
+    const set=function(sel,v){const e=$(sel);if(e!=null)e.value=v};
+    set('#f-title',t.name);set('#f-body',t.body||'');
+    if(t.cls)set('#f-cls',t.cls);
+    if(t.cat)set('#f-cat',t.cat);
+    if($('#r-freq')){$('#r-freq').value=(t.recurrence&&t.recurrence.freq)||'none';recUI()}
+    toast('Template loaded — pick a date and save');
+  },30);
+}
+function delTemplate(id){D.templates=(D.templates||[]).filter(x=>x.id!==id);save();templateSheet()}
+
+/* ================= built-in browser ================= */
+function viewBrowser(){
+  const bm=D.bookmarks||[];
+  return '<h1>Browser</h1><p class="empty">Saved websites. “Open” uses the in-app browser on your tablet; “External” opens your normal browser for sites that block embedding or need unsupported sign-in.</p>'+
+    '<div class="row"><input id="f-url" placeholder="example.com" style="flex:1" title="Website address"><input id="f-name" placeholder="Name (optional)" style="width:10em" title="Shortcut name"><button class="primary" onclick="addBookmark()" title="Save this website as a shortcut">+ Save</button></div>'+
+    '<div class="cols">'+(bm.length?bm.map(b=>'<div class="panel"><h3>'+esc(b.name)+'</h3><small>'+esc(b.url)+'</small><div class="row"><button class="primary" onclick="openUrl(\''+esc(b.url)+'\',0)" title="Open inside FlowState">Open</button><button onclick="openUrl(\''+esc(b.url)+'\',1)" title="Open in your normal browser">External</button><button class="danger" onclick="delBookmark(\''+b.id+'\')" title="Remove shortcut">Delete</button></div></div>').join(''):'<p class="empty">No saved websites yet.</p>')+'</div>';
+}
+function addBookmark(){
+  let u=val('url').trim();if(!u)return toast('Enter a website address');
+  if(!/^https?:\/\//i.test(u))u='https://'+u;
+  const n=val('name').trim()||u.replace(/^https?:\/\//,'').split('/')[0];
+  D.bookmarks=D.bookmarks||[];D.bookmarks.push({id:uid(),name:n,url:u});save();render();
+}
+function delBookmark(id){D.bookmarks=(D.bookmarks||[]).filter(b=>b.id!==id);save();render()}
+function openUrl(u,external){
+  const isAndroid=/Android/i.test(navigator.userAgent);
+  if(external||!isAndroid){window.open(u,'_blank','noopener');return}
+  window.location.href='flowstate://browse?url='+encodeURIComponent(u);
+}
+
+/* ================= decorative widgets + image library ================= */
+const QUOTES=[
+  'Small steps, every day, become a different life.',
+  'You do not have to be extreme, just consistent.',
+  'Discipline is choosing what you want most over what you want now.',
+  'Start where you are. Use what you have. Do what you can.',
+  'The work you avoid is usually the work that matters.',
+  'Progress hides in the days you feel like quitting.',
+  'One page, one problem, one hour at a time.',
+  'Rest is part of the plan, not a break from it.'
+];
+const SCENES={
+  'Mountain dawn':['#f7b267','#f4845f','#fff3b0'],
+  'Ocean calm':['#3a86ff','#4cc9f0','#ffffff'],
+  'Forest trail':['#2d6a4f','#40916c','#d8f3dc'],
+  'City dusk':['#3d405b','#e07a5f','#f4f1de'],
+  'Desert sun':['#e76f51','#f4a261','#ffe8d6'],
+  'Night sky':['#14213d','#1b263b','#e0e1dd']
+};
+function sceneUrl(name){
+  const p=SCENES[name]||SCENES['Mountain dawn'];
+  const svg='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 240"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="'+p[0]+'"/><stop offset="1" stop-color="'+p[1]+'"/></linearGradient></defs><rect width="400" height="240" fill="url(#g)"/><circle cx="312" cy="56" r="24" fill="'+p[2]+'" opacity="0.85"/><path d="M0 176 L70 104 L130 158 L196 92 L268 168 L330 120 L400 178 L400 240 L0 240 Z" fill="#000" opacity="0.28"/><path d="M0 206 L96 152 L170 200 L250 148 L330 198 L400 172 L400 240 L0 240 Z" fill="#000" opacity="0.38"/></svg>';
+  return 'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg);
+}
+let WSEED=0;
+function widgetCfg(){const w=D.settings.widget||{};return {on:!!w.on,size:w.size||'m',rotate:w.rotate||'tab',cols:w.collections||['scenic','quote']}}
+function widgetPool(){
+  const c=widgetCfg(),p=[];
+  if(c.cols.includes('scenic'))Object.keys(SCENES).forEach(k=>p.push({t:'img',src:sceneUrl(k),label:k}));
+  if(c.cols.includes('user'))(D.images||[]).forEach(im=>p.push({t:'img',src:im.src,label:im.name||'My image'}));
+  if(c.cols.includes('quote'))QUOTES.forEach(q=>p.push({t:'quote',txt:q,label:'Daily inspiration'}));
+  return p;
+}
+function widgetIndex(n){
+  const c=widgetCfg();
+  if(c.rotate==='daily'){const d=new Date();return Math.floor(new Date(d.getFullYear(),d.getMonth(),d.getDate()).getTime()/864e5)%n}
+  const tabs=Object.keys(CATS);return (WSEED+tabs.indexOf(S.tab)+3)%n;
+}
+function widgetHtml(){
+  const c=widgetCfg();if(!c.on)return '';
+  const p=widgetPool();if(!p.length)return '';
+  const it=p[widgetIndex(p.length)];
+  const h=c.size==='s'?120:c.size==='l'?300:190;
+  const inner=it.t==='quote'?'<div class="wq">“'+esc(it.txt)+'”</div>':'<img src="'+it.src+'" alt="'+esc(it.label)+'"><span class="wlab">'+esc(it.label)+'</span>';
+  return '<div class="widget" style="height:'+h+'px">'+inner+'<button class="wref" onclick="refreshWidget()" title="Show another image or quote">⟳</button></div>';
+}
+function refreshWidget(){WSEED++;render();toast('Refreshed')}
+function addImages(files){
+  [...files].forEach(f=>{
+    const r=new FileReader();
+    r.onload=function(){
+      const im=new Image();
+      im.onload=function(){
+        const mx=560,sc=Math.min(1,mx/Math.max(im.width,im.height));
+        const cv=document.createElement('canvas');
+        cv.width=Math.round(im.width*sc)||1;cv.height=Math.round(im.height*sc)||1;
+        cv.getContext('2d').drawImage(im,0,0,cv.width,cv.height);
+        D.images=D.images||[];
+        D.images.push({id:uid(),name:f.name.replace(/\.[^.]+$/,''),src:cv.toDataURL('image/jpeg',0.72)});
+        save();render();toast('Image added to your library');
+      };
+      im.src=r.result;
+    };
+    r.readAsDataURL(f);
+  });
+}
+function delImage(id){D.images=(D.images||[]).filter(x=>x.id!==id);save();render()}
+function setWidget(k,v){D.settings.widget=D.settings.widget||{};D.settings.widget[k]=v;save();render()}
+function toggleWidgetCol(v,on){
+  const c=widgetCfg();let cols=c.cols.slice();
+  if(on&&!cols.includes(v))cols.push(v);
+  if(!on)cols=cols.filter(x=>x!==v);
+  setWidget('collections',cols);
+}
+function lookSheet(){
+  const c=widgetCfg();const imgs=D.images||[];
+  sheet('<h2>Look &amp; widgets</h2>'+
+    '<div class="panel"><h3>Decorative widget</h3>'+
+    '<label class="chip"><input type="checkbox" '+(c.on?'checked':'')+' onchange="setWidget(\'on\',this.checked)" title="Show a decorative widget on category pages"> Show widget</label>'+
+    '<div class="row"><span>Size</span>'+['s','m','l'].map(s=>'<label class="chip"><input type="radio" name="wsz" '+(c.size===s?'checked':'')+' onchange="setWidget(\'size\',\''+s+'\')" title="Widget size"> '+(s==='s'?'Small':s==='m'?'Medium':'Large')+'</label>').join('')+'</div>'+
+    '<div class="row"><span>Change</span>'+[['tab','When I open a tab'],['daily','Daily']].map(o=>'<label class="chip"><input type="radio" name="wrot" '+(c.rotate===o[0]?'checked':'')+' onchange="setWidget(\'rotate\',\''+o[0]+'\')" title="When images change"> '+o[1]+'</label>').join('')+'</div>'+
+    '<div class="row"><label class="chip"><input type="checkbox" '+(c.cols.includes('scenic')?'checked':'')+' onchange="toggleWidgetCol(\'scenic\',this.checked)" title="Scenic artwork"> Scenic artwork</label>'+
+    '<label class="chip"><input type="checkbox" '+(c.cols.includes('quote')?'checked':'')+' onchange="toggleWidgetCol(\'quote\',this.checked)" title="Motivational quotes"> Quotes</label>'+
+    '<label class="chip"><input type="checkbox" '+(c.cols.includes('user')?'checked':'')+' onchange="toggleWidgetCol(\'user\',this.checked)" title="My uploaded images"> My images</label></div>'+
+    '<div class="row"><button onclick="refreshWidget()" title="Show another now">Refresh now</button></div></div>'+
+    '<div class="panel"><h3>My image library</h3><p class="empty">Stored on this device, so they stay available offline.</p>'+
+    '<div class="row"><input type="file" accept="image/*" multiple onchange="addImages(this.files)" title="Add images from this device"></div>'+
+    '<div class="books" style="grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px">'+
+    (imgs.length?imgs.map(im=>'<div style="position:relative"><img src="'+im.src+'" alt="'+esc(im.name||'')+'" style="width:100%;height:86px;object-fit:cover;border-radius:10px"><button class="danger" style="position:absolute;top:4px;right:4px;width:28px;height:28px;padding:0;border-radius:50%" onclick="delImage(\''+im.id+'\')" title="Remove image">✕</button></div>').join(''):'<p class="empty">No images yet.</p>')+'</div></div>'+
+    '<div class="panel"><h3>Schedule templates</h3><button onclick="closeSheet();templateSheet()" title="Open templates">Open templates</button></div>');
+}
+
+/* ================= global search ================= */
+function openSearch(){
+  sheet('<h2>Search</h2><input id="f-q" placeholder="Notes, recordings, assignments, events, bookmarks" oninput="liveSearch(this.value)" title="Type to search everything"><div id="qres"><p class="empty">Type to search across your whole app.</p></div>');
+  setTimeout(function(){const q=$('#f-q');if(q)q.focus()},60);
+}
+function searchAll(q){
+  q=(q||'').toLowerCase().trim();if(!q)return [];
+  const out=[];
+  (D.items||[]).forEach(function(i){
+    const hay=(i.title+' '+(i.body||'')+' '+(LABEL[i.type]||'')+' '+(i.cls?clsName(i.cls):'')).toLowerCase();
+    if(hay.indexOf(q)>=0)out.push({kind:'item',id:i.id,title:i.title,sub:(LABEL[i.type]||'')+(i.cls?' · '+clsName(i.cls):'')+(i.due?' · '+fmt(i.due):'')});
+  });
+  (D.bookmarks||[]).forEach(function(b){
+    if((b.name+' '+b.url).toLowerCase().indexOf(q)>=0)out.push({kind:'bm',url:b.url,title:b.name,sub:'Bookmark · '+b.url});
+  });
+  (D.images||[]).forEach(function(im){
+    if((im.name||'').toLowerCase().indexOf(q)>=0)out.push({kind:'img',title:im.name||'Image',sub:'My image library'});
+  });
+  return out.slice(0,60);
+}
+function liveSearch(q){
+  const r=searchAll(q),box=$('#qres');if(!box)return;
+  box.innerHTML=r.length?r.map(function(x){
+    const act=x.kind==='item'?'closeSheet();openDetail(\''+x.id+'\')':x.kind==='bm'?'openUrl(\''+esc(x.url)+'\',0)':'closeSheet();lookSheet()';
+    return '<div class="card" onclick="'+act+'"><div class="grow"><b>'+esc(x.title)+'</b><small>'+esc(x.sub)+'</small></div></div>';
+  }).join(''):'<p class="empty">Nothing found.</p>';
+}
+
+/* ================= focus mode ================= */
+function viewFocus(){
+  const next=(D.items||[]).filter(i=>!i.done&&i.due).sort((a,b)=>new Date(a.due)-new Date(b.due))[0];
+  const today=(D.items||[]).filter(i=>!i.done&&i.due&&dk(i.due)===dk(new Date()));
+  return '<h1>Focus mode</h1><p class="empty">Distractions are hidden. One thing at a time.</p>'+
+    (next?'<div class="panel"><h3>Next up</h3><b>'+esc(next.title)+'</b><small>'+esc(fmt(next.due))+'</small><div class="row"><button class="primary" onclick="openDetail(\''+next.id+'\')" title="Open this item">Open</button><button onclick="toggleDone(\''+next.id+'\')" title="Mark complete">Done</button></div></div>':'<p class="empty">Nothing scheduled. Enjoy the space.</p>')+
+    '<p class="empty">Today: '+today.length+' open item'+(today.length===1?'':'s')+'.</p>'+
+    '<div class="row"><button onclick="go2(\'home\')" title="Leave focus mode">Leave focus mode</button></div>';
+}
+
+/* ================= universal quick add ================= */
+function quickAdd(){
+  sheet('<h2>Quick add</h2><p class="empty">What would you like to add?</p>'+
+    '<div class="row"><button class="primary" onclick="closeSheet();openDayAdd(\'event\')" title="Add an event">📅 Event</button>'+
+    '<button onclick="closeSheet();openDayAdd(\'homework\')" title="Add a task">✅ Task</button>'+
+    '<button onclick="closeSheet();openDayAdd(\'note\')" title="Add a note">📝 Note</button>'+
+    '<button onclick="closeSheet();openDayAdd(\'reminder\')" title="Add a reminder">⏰ Reminder</button></div>'+
+    '<div class="row"><button onclick="closeSheet();templateSheet()" title="Use a schedule template">🔁 From template</button>'+
+    '<button onclick="closeSheet();go2(\'browser\')" title="Save a website">🌐 Bookmark</button></div>');
+}
 
 function hold(el,tap,long){
   let t,fired=false,skip=false;
