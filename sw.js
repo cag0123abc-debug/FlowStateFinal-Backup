@@ -1,4 +1,4 @@
-const CACHE_NAME = 'flowstate-v3';
+const CACHE_NAME = 'flowstate-v4';
 const APP_SHELL = [
   './',
   './index.html',
