@@ -198,16 +198,32 @@ body.focusmode .sticky{display:none}
 <div id="bubble"></div>
 <script>
 const clone=o=>JSON.parse(JSON.stringify(o));
-const KEY='flowstate-v2';
+const KEY='flowstate-v3';
+const OLDKEYS=['flowstate-v2'];
 const PAL=['#ff8fa3','#8fd3a8','#f7c77a','#9db4f0','#c39bf0','#7fd6e8','#f49a6b'];
-const DEF={items:[],classes:[{id:'math',name:'Math',icon:'➕',color:'#ff8fa3'}],notifs:[],dnd:false,fired:{},
+const DEF={items:[],classes:[{id:'math',name:'Math',icon:'➕',color:'#ff8fa3'}],notifs:[],dnd:false,fired:{},templates:[],images:[],bookmarks:[],
   settings:{speed:1,reduce:false,font:'system-ui, sans-serif',fs:16,text:'#1d2440',cal:'#3d5ba9',
-  bg:{home:'#f5e6e1',school:'#f7dede',work:'#dfe7f5',deyc:'#dcf2e2',personal:'#e5dcf5'}}};
+  bg:{home:'#f5e6e1',school:'#f7dede',work:'#dfe7f5',deyc:'#dcf2e2',personal:'#e5dcf5'},
+  widget:{on:true,size:'m',rotate:'tab',collections:['scenic','quote'],showOn:['home']},dash:{hidden:[],order:null}}};
+function migrate(x){
+  const d=clone(DEF);
+  const out=Object.assign(d,x,{settings:Object.assign(d.settings,x.settings||{},{bg:Object.assign(d.settings.bg,(x.settings||{}).bg||{}),bgImg:Object.assign({},(x.settings||{}).bgImg||{}),widget:Object.assign(d.settings.widget,(x.settings||{}).widget||{}),dash:Object.assign(d.settings.dash,(x.settings||{}).dash||{})})});
+  out.templates=Array.isArray(x.templates)?x.templates:[];
+  out.images=Array.isArray(x.images)?x.images:[];
+  out.bookmarks=Array.isArray(x.bookmarks)?x.bookmarks:[];
+  out.items=(x.items||[]).map(i=>Object.assign({recurrence:null,seriesId:null,exceptions:[],gcalId:null,gcalCal:null,source:'local'},i));
+  out.classes=(Array.isArray(x.classes)?x.classes:d.classes).map((c,ix)=>Object.assign({order:ix,book:{cover:null,tint:null,stickers:[],subtitle:''}},c,{book:Object.assign({cover:null,tint:null,stickers:[],subtitle:''},c.book||{})}));
+  return out;
+}
 function load(){
+  let x=null;
   try{
-    const x=JSON.parse(localStorage.getItem(KEY));
-    if(x&&x.items){const d=clone(DEF);return Object.assign(d,x,{settings:Object.assign(d.settings,x.settings||{},{bg:Object.assign(d.settings.bg,(x.settings||{}).bg||{})})})}
+    x=JSON.parse(localStorage.getItem(KEY));
+    if(!x||!x.items){
+      for(const k of OLDKEYS){const o=JSON.parse(localStorage.getItem(k)||'null');if(o&&o.items){x=o;break}}
+    }
   }catch(e){}
+  if(x&&x.items)return migrate(x);
   return clone(DEF);
 }
 let D=load();
@@ -225,6 +241,7 @@ const BGK=['home','school','work','deyc','personal'];
 const RAIL=[['home','🏠','Home'],['school','🎓','School'],['work','💼','Work'],['deyc','🤝','DEYC'],['personal','🌟','Personal']];
 const LISTS=['Must Watch','Must Read','Must Play','To Do','Websites','Potential Ideas','Games to Play'];
 const LABEL={event:'Event',homework:'Homework',test:'Test',summary:'Summary',project:'Project',note:'Note',bucket:'List item',recording:'Recording'};
+const WDAYS=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 let FORM={},REC=null,RC='school',CCOL=PAL[0],UNDO=null,TT=null,CONF=null;
 S.sel=dk(new Date());
 S.month=new Date(new Date().getFullYear(),new Date().getMonth(),1);
