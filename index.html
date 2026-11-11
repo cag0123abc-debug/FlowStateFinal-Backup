@@ -184,7 +184,9 @@ body.focusmode .sticky{display:none}
       <div class="tr">
         <span id="clock"></span>
         <button onclick="openSearch()" title="Search">🔍</button>
-        <button onclick="go2('notifs')" title="Notifications">🔔<i id="badge"></i></button>
+        <button onclick="openSearch()" title="Search everything">🔎</button>
+      <button onclick="go2('focus')" title="Focus mode">🎯</button>
+      <button onclick="go2('notifs')" title="Notifications">🔔<i id="badge"></i></button>
         <button onclick="go2('settings')" title="Settings">⚙️</button>
       </div>
     </header>
@@ -470,7 +472,7 @@ function render(){
   applyStyle();rail();
   const t=S.tab,v=$('#view');
   v.className=S.enter?'enter':'';S.enter=false;
-  v.innerHTML=t==='home'?viewHome():t==='school'?(S.cls?viewClass(S.cls):viewClassSelect()):t==='personal'?viewPersonal():t==='notifs'?viewNotifs():t==='settings'?viewSettings():viewCat(t);
+  v.innerHTML=t==='home'?viewHome():t==='school'?(S.cls?viewClass(S.cls):viewClassSelect()):t==='personal'?viewPersonal():t==='notifs'?viewNotifs():t==='settings'?viewSettings():t==='browser'?viewBrowser():t==='focus'?viewFocus():viewCat(t);
   bind(v);
   $('#schoolBtn').classList.toggle('on',t==='school'&&!!S.cls);
   if(t==='school'&&!S.cls&&S.bubble)showBubble();else hideBubble();
@@ -479,7 +481,7 @@ function render(){
 }
 function updateBell(){const n=D.notifs.filter(x=>!x.read).length;$('#badge').textContent=n||''}
 
-const card=i=>`<div class="card${i.done?' done':''}" data-item="${i.id}">${['homework','test','bucket','project'].includes(i.type)?`<button class="chk" onclick="toggleDone('${i.id}')">${i.done?'✓':''}</button>`:''}<div class="grow"><b>${esc(i.title)}</b><small>${i.due?esc(fmt(i.due))+' · ':''}${esc(LABEL[i.type]||'')}${i.cls?' · '+esc(clsName(i.cls)):''}${i.priority==='high'?' · 🔴 High priority':i.priority==='low'?' · Low priority':''}</small></div></div>`;
+const card=i=>`<div class="card${i.done?' done':''}" data-item="${i.id}">${['homework','test','bucket','project'].includes(i.type)?`<button class="chk" onclick="toggleDone('${i.id}')">${i.done?'✓':''}</button>`:''}<div class="grow"><b>${esc(i.title)}</b><small>${i.due?esc(fmt(i.due))+' · ':''}${esc(LABEL[i.type]||'')}${i.cls?' · '+esc(clsName(i.cls)):''}${i.priority==='high'?' · 🔴 High priority':i.priority==='low'?' · Low priority':''}${recActive(i)?' · 🔁 '+esc(recSummary(i)):''}${i.source==='google'?' · 📅 Google':''}</small></div></div>`;
 const list=a=>a.length?a.map(card).join(''):'<p class="empty">Nothing here yet. Tap + to add.</p>';
 
 function viewHome(){
@@ -749,12 +751,12 @@ function openForm(type,id,pre={}){
     <label>Frequency <select id="r-freq" onchange="recUI()">
       ${opt('none','Does not repeat',r.freq)}${opt('daily','Daily',r.freq)}${opt('weekly','Weekly',r.freq)}${opt('monthly','Monthly',r.freq)}${opt('yearly','Yearly',r.freq)}
     </select></label>
-    <div id="r-week" style="display:none"><b>On these days</b><div class="row">${WDAYS.map((d,ix)=>`<label class="chip"><input type="checkbox" class="r-wd" value="${ix}" ${wd.includes(ix)?'checked':''}> ${d}</label>`).join('')}</div></div>
-    <div id="r-month" style="display:none">
+    <div id="r-week" style="display:${r.freq==='weekly'?'':'none'}"><b>On these days</b><div class="row">${WDAYS.map((d,ix)=>`<label class="chip"><input type="checkbox" class="r-wd" value="${ix}" ${wd.includes(ix)?'checked':''}> ${d}</label>`).join('')}</div></div>
+    <div id="r-month" style="display:${r.freq==='monthly'?'':'none'}">
       <label>Pattern <select id="r-mmode" onchange="recUI()">
         ${opt('day','Same date each month',mm)}${opt('nth','Nth weekday of the month',mm)}
       </select></label>
-      <div id="r-nth" style="display:none" class="row">
+      <div id="r-nth" style="display:${(r.freq==='monthly'&&mm==='nth')?'':'none'}" class="row">
         <select id="r-n">${[1,2,3,4,5].map(n=>opt(n,['1st','2nd','3rd','4th','5th'][n-1],r.nth||1)).join('')}</select>
         <select id="r-nwd">${WDAYS.map((d,ix)=>opt(ix,d,r.nthWeekday==null?5:r.nthWeekday)).join('')}</select>
       </div>
