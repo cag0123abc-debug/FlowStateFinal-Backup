@@ -503,15 +503,85 @@ function setBgImg(file,k){
 }
 
 function viewClassSelect(){
-  return `<h1>Classes</h1><p class="empty">Tap a class for quick options. Hold a class to open its tab.</p>
-  <div class="grid">${D.classes.map(c=>`<div class="blob${S.bubble&&S.bubble!==c.id?' pushed':''}" data-cls="${c.id}" style="background:${c.color};width:${Math.round((c.size||1)*100)}%;justify-self:center"><span class="ico">${clsIco(c)}</span><b>${esc(c.name)}</b></div>`).join('')}</div>`;
+  const cs=[...D.classes].sort((a,b)=>(a.order==null?999:a.order)-(b.order==null?999:b.order));
+  return `<h1>Classes</h1><p class="empty">Tap a book to open it. Hold a book to jump to its tab. Use the arrows to rearrange, ⚙ to customize.</p>
+  <div class="books">${cs.map(c=>bookCard(c)).join('')}</div>
+  <div class="row"><button class="primary" onclick="openForm('class')">+ Add class</button></div>`;
+}
+function bookCard(c){
+  const b=c.book||{};const tint=b.tint||c.color;
+  const counts=D.items.filter(i=>i.cls===c.id).length;
+  const st=(b.stickers||[]).map(s=>`<span style="left:${s.x}%;top:${s.y}%;font-size:${s.s||26}px">${esc(s.e)}</span>`).join('');
+  return `<div class="book" data-cls="${c.id}" style="background:${tint}">
+    ${b.cover?`<img class="cover" src="${b.cover}" alt="">`:'<div class="shade"></div>'}
+    <div class="spine"></div>
+    <div class="stickers">${st}</div>
+    <div class="bcount" title="${counts} items">${counts}</div>
+    <div class="bico">${c.img?`<img src="${c.img}" alt="">`:esc(c.icon)}</div>
+    <div class="bmeta"><b>${esc(c.name)}</b><small>${esc(b.subtitle||'')}</small></div>
+    <div class="reorder">
+      <button onclick="event.stopPropagation();moveBook('${c.id}',-1)" title="Move left">◀</button>
+      <button onclick="event.stopPropagation();editBook('${c.id}')" title="Customize this book">⚙</button>
+      <button onclick="event.stopPropagation();moveBook('${c.id}',1)" title="Move right">▶</button>
+    </div></div>`;
+}
+function moveBook(id,dir){
+  const cs=[...D.classes].sort((a,b)=>(a.order==null?999:a.order)-(b.order==null?999:b.order));
+  const i=cs.findIndex(c=>c.id===id),j=i+dir;
+  if(i<0||j<0||j>=cs.length)return;
+  const t=cs[i];cs[i]=cs[j];cs[j]=t;
+  cs.forEach((c,k)=>{c.order=k});save();render();
+}
+function editBook(id){
+  const c=D.classes.find(x=>x.id===id);if(!c)return;
+  c.book=c.book||{cover:null,tint:null,stickers:[],subtitle:''};
+  BOOKID=id;
+  const st=(c.book.stickers||[]).map((s,i)=>`<span class="chip">${esc(s.e)} <button onclick="delSticker(${i})">×</button></span>`).join('');
+  sheet(`<h2>Customize “${esc(c.name)}”</h2>
+  <label>Custom title <input id="bk-title" value="${esc(c.name)}"></label>
+  <label>Subtitle <input id="bk-sub" placeholder="e.g. Period 3" value="${esc(c.book.subtitle||'')}"></label>
+  <label>Cover image <input type="file" accept="image/*" onchange="pickBookCover(this.files[0])"></label>
+  <div class="row"><button onclick="c.book.cover=null;save();closeSheet();render()">Remove cover</button></div>
+  <label>Cover colour <input type="color" value="${c.book.tint||c.color}" onchange="c.book.tint=this.value;save();render()"></label>
+  <label>Add sticker or emoji <input id="bk-st" placeholder="🎧 or 📚" maxlength="4" onkeydown="if(event.key==='Enter')addSticker()"></label>
+  <div class="row"><button onclick="addSticker()">Add sticker</button>${st}</div>
+  <p class="empty">Stickers appear at random spots on the cover. Tap Add sticker again to reposition.</p>
+  <div class="row"><button class="primary" onclick="saveBook()">Save</button><button onclick="closeSheet()">Cancel</button></div>`);
+}
+function pickBookCover(f){
+  if(!f)return;const c=D.classes.find(x=>x.id===BOOKID);if(!c)return;
+  const r=new FileReader();
+  r.onload=()=>{const im=new Image();im.onload=()=>{
+    const mx=560,sc=Math.min(1,mx/Math.max(im.width,im.height));
+    const cv=document.createElement('canvas');cv.width=Math.round(im.width*sc);cv.height=Math.round(im.height*sc);
+    cv.getContext('2d').drawImage(im,0,0,cv.width,cv.height);
+    c.book.cover=cv.toDataURL('image/jpeg',0.72);save();toast('Cover saved');
+  };im.src=r.result};
+  r.readAsDataURL(f);
+}
+function addSticker(){
+  const c=D.classes.find(x=>x.id===BOOKID);const el=$('#bk-st');if(!c||!el)return;
+  const e=el.value.trim();if(!e)return;
+  c.book.stickers=c.book.stickers||[];
+  c.book.stickers.push({e,x:10+Math.round(Math.random()*70),y:10+Math.round(Math.random()*55),s:22+Math.round(Math.random()*14)});
+  el.value='';save();editBook(BOOKID);
+}
+function delSticker(i){
+  const c=D.classes.find(x=>x.id===BOOKID);if(!c)return;
+  c.book.stickers.splice(i,1);save();editBook(BOOKID);
+}
+function saveBook(){
+  const c=D.classes.find(x=>x.id===BOOKID);if(!c)return;
+  const t=val('title').trim();if(t)c.name=t;
+  c.book.subtitle=val('sub').trim();
+  save();closeSheet();render();
 }
 function viewClass(id){
   const c=D.classes.find(x=>x.id===id);if(!c){S.cls=null;return viewClassSelect()}
   const sums=D.items.filter(i=>i.type==='summary'&&i.cls===id).sort(byC);
   const hw=D.items.filter(i=>(i.type==='homework'||i.type==='test')&&i.cls===id).sort((a,b)=>new Date(a.due||0)-new Date(b.due||0));
   return `<h1>${esc(c.icon)} ${esc(c.name)}</h1><div class="cols">
-    <div class="panel tall"><h3>Recent Class Summary</h3>${sums[0]?card(sums[0])+`<div class="body">${esc(sums[0].body)}</div>`:'<p class="empty">No summaries yet.</p>'}</div>
+    <div class="panel tall"><h3>Recent Class Summary</h3>${sums[0]?card(sums[0])+bodyHtml(sums[0].body,'cs-'+sums[0].id):'<p class="empty">No summaries yet.</p>'}</div>
     <div class="stack"><div class="panel"><h3>Previous Summaries</h3>${list(sums.slice(1))}</div>
     <div class="panel"><h3>Homework + Studying</h3><div class="row"><button class="primary" onclick="openFocus()">Focus timer</button></div>${list(hw)}</div></div></div>`;
 }
@@ -520,7 +590,7 @@ function viewCat(c){
   const proj=D.items.filter(i=>i.type==='project'&&i.cat===c).sort(byC);
   const n=CATS[c];
   return `<h1>${n}</h1><div class="cols">
-    <div class="panel tall"><h3>Recent ${n} Summary</h3>${sums[0]?card(sums[0])+`<div class="body">${esc(sums[0].body)}</div>`:'<p class="empty">No summaries yet.</p>'}</div>
+    <div class="panel tall"><h3>Recent ${n} Summary</h3>${sums[0]?card(sums[0])+bodyHtml(sums[0].body,'ct-'+sums[0].id):'<p class="empty">No summaries yet.</p>'}</div>
     <div class="stack"><div class="panel"><h3>Previous Summaries</h3>${list(sums.slice(1))}</div>
     <div class="panel"><h3>${c==='work'?'Current Projects':'Meetings and Events'}</h3>${list(proj)}</div></div></div>`;
 }
@@ -686,7 +756,7 @@ function openDetail(id){
   ${i.due?`<p>Due ${esc(fmt(i.due))}</p>`:''}
   ${i.reminders&&i.reminders.length?`<p>Reminders: ${i.reminders.join(', ')} min before</p>`:''}
   ${i.duration?`<p>Length: ${fmtDur(i.duration*1000)}</p>`:''}
-  <div class="body">${esc(i.body)}</div>
+  ${bodyHtml(i.body,'dt-'+i.id)}
   <div class="row">${i.type==='recording'?'':`<button onclick="openForm(null,'${id}')">Edit</button>`}${i.due?`<button onclick="icsFor('${id}')">Calendar file</button>`:''}<button class="danger" onclick="delItem('${id}')">Delete</button><button onclick="closeSheet()">Close</button></div>`);
 }
 function delItem(id){
