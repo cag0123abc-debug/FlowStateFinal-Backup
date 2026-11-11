@@ -248,6 +248,112 @@ S.month=new Date(new Date().getFullYear(),new Date().getMonth(),1);
 
 function save(){try{localStorage.setItem(KEY,JSON.stringify(D))}catch(e){toast('Storage is full. Try a smaller image or remove one.')}}
 
+/* ================= recurrence engine ================= */
+function recActive(i){const r=i&&i.recurrence;return !!(r&&r.freq&&r.freq!=='none')}
+function sod(d){return new Date(d.getFullYear(),d.getMonth(),d.getDate())}
+function daysBetween(a,b){return Math.round((sod(b)-sod(a))/864e5)}
+function monthsBetween(a,b){return (b.getFullYear()-a.getFullYear())*12+(b.getMonth()-a.getMonth())}
+function nthWeekdayDate(y,m,n,wd){const f=new Date(y,m,1);const day=1+((wd-f.getDay()+7)%7)+(n-1)*7;const d=new Date(y,m,day);return d.getMonth()===m?d:null}
+function nthInMonth(d,wd){if(d.getDay()!==wd)return 0;return Math.floor((d.getDate()-1)/7)+1}
+function isSkipped(i,d){return (i.exceptions||[]).indexOf(dk(d))>-1}
+function occursOnDate(i,d){
+  if(!i.due)return false;
+  const base=new Date(i.due);if(isNaN(base))return false;
+  const bd=sod(base),dd=sod(d);
+  if(dd<bd)return false;
+  if(!recActive(i))return dd.getTime()===bd.getTime();
+  if(isSkipped(i,dd))return false;
+  const r=i.recurrence;
+  if(r.until){const u=new Date(r.until+'T23:59:59');if(!isNaN(u)&&dd>u)return false}
+  const iv=Math.max(1,parseInt(r.interval,10)||1);
+  if(r.freq==='daily')return daysBetween(bd,dd)%iv===0;
+  if(r.freq==='weekly'){
+    const wd=(Array.isArray(r.weekdays)&&r.weekdays.length)?r.weekdays:[bd.getDay()];
+    if(wd.indexOf(dd.getDay())<0)return false;
+    const a=new Date(bd);a.setDate(bd.getDate()-bd.getDay());
+    const b=new Date(dd);b.setDate(dd.getDate()-dd.getDay());
+    return (Math.round((b-a)/(864e5*7)))%iv===0;
+  }
+  if(r.freq==='monthly'){
+    if(monthsBetween(bd,dd)%iv!==0)return false;
+    if(r.monthlyMode==='nth'){
+      const n=parseInt(r.nth,10)||1,wd=parseInt(r.nthWeekday,10);
+      if(isNaN(wd)||dd.getDay()!==wd)return false;
+      return nthInMonth(dd,wd)===n;
+    }
+    return dd.getDate()===bd.getDate();
+  }
+  if(r.freq==='yearly'){
+    if((dd.getFullYear()-bd.getFullYear())%iv!==0)return false;
+    return dd.getMonth()===bd.getMonth()&&dd.getDate()===bd.getDate();
+  }
+  return dd.getTime()===bd.getTime();
+}
+function occAt(i,d){const base=new Date(i.due);const o=new Date(d);o.setHours(base.getHours(),base.getMinutes(),0,0);return o}
+function occurrencesInRange(i,from,to){
+  if(!i.due)return[];
+  const base=new Date(i.due);if(isNaN(base))return[];
+  if(!recActive(i))return (base>=from&&base<=to)?[base]:[];
+  const t=sod(to),cnt=parseInt(i.recurrence.count,10)||0;
+  let start=sod(base);
+  if(!cnt&&sod(from)>start)start=sod(from);
+  const out=[];let d=new Date(start),n=0,guard=0;
+  while(d<=t&&guard++<4000){
+    if(occursOnDate(i,d)){n++;if(!cnt||n<=cnt)out.push(occAt(i,d));else break}
+    d=new Date(d.getFullYear(),d.getMonth(),d.getDate()+1);
+  }
+  return out.filter(x=>x>=from&&x<=to);
+}
+function expandRange(from,to){
+  const out=[];
+  D.items.forEach(i=>occurrencesInRange(i,from,to).forEach(d=>out.push({item:i,date:d,key:dk(d)})));
+  return out.sort((a,b)=>a.date-b.date);
+}
+function itemsOnDay(k){
+  const from=new Date(k+'T00:00'),to=new Date(k+'T23:59:59');
+  const seen={},out=[];
+  expandRange(from,to).forEach(o=>{if(!seen[o.item.id]){seen[o.item.id]=1;out.push(o.item)}});
+  return out;
+}
+function recSummary(i){
+  const r=i.recurrence;if(!recActive(i))return '';
+  const iv=parseInt(r.interval,10)||1;
+  if(r.freq==='daily')return iv>1?'Every '+iv+' days':'Daily';
+  if(r.freq==='weekly'){
+    const wd=(r.weekdays||[]).slice().sort().map(d=>WDAYS[d]);
+    return (iv>1?'Every '+iv+' weeks':'Weekly')+(wd.length?' on '+wd.join(', '):'');
+  }
+  if(r.freq==='monthly'){
+    if(r.monthlyMode==='nth')return (iv>1?'Every '+iv+' months':'Monthly')+' on the '+['','1st','2nd','3rd','4th','5th'][parseInt(r.nth,10)||1]+' '+WDAYS[parseInt(r.nthWeekday,10)];
+    return iv>1?'Every '+iv+' months':'Monthly';
+  }
+  if(r.freq==='yearly')return iv>1?'Every '+iv+' years':'Yearly';
+  return '';
+}
+function skipOccurrence(id,k){
+  const i=D.items.find(x=>x.id===id);if(!i)return;
+  i.exceptions=i.exceptions||[];
+  if(i.exceptions.indexOf(k)<0)i.exceptions.push(k);
+  save();closeSheet();render();toast('Occurrence skipped');
+}
+function bodyHtml(text,id){
+  const t=String(text==null?'':text);
+  const long=t.length>520||t.split('\n').length>10;
+  return `<div class="body${long?' clamped':''}" id="bd-${id}">${esc(t)}</div>`+(long?`<button class="expbtn" onclick="toggleBody('${id}',this)">Show more</button>`:'');
+}
+function toggleBody(id,btn){
+  const el=document.getElementById('bd-'+id);if(!el)return;
+  const c=el.classList.toggle('clamped');
+  btn.textContent=c?'Show more':'Show less';
+}
+function openDayAdd(type,rem){
+  const pre={due:S.sel+'T09:00'};
+  if(type==='note')delete pre.due;
+  if(S.tab==='school'&&S.cls){pre.cls=S.cls;pre.cat='school'}
+  openForm(type,null,pre);
+  if(rem)setTimeout(()=>{document.querySelectorAll('.rem').forEach(c=>{if(c.value==='10')c.checked=true})},0);
+}
+
 // Google sync uses the user's Apps Script web app. Requests are sent as
 // text/plain so the endpoint can accept them without a browser CORS preflight.
 const GOOGLE_SYNC_URL='https://script.google.com/macros/s/AKfycbxF-v0PypnUbO-h9mPWKc5E8LIjJUe2WosWHY2C-Le2j4lpYwtdY1EBE06u0Dh64vP4Yw/exec';
@@ -352,11 +458,12 @@ function viewHome(){
   const overdue=D.items.filter(i=>!i.done&&i.due&&new Date(i.due).getTime()<now).sort((a,b)=>new Date(a.due)-new Date(b.due));
   const todayItems=D.items.filter(i=>!i.done&&i.due&&dk(new Date(i.due))===dk(new Date())).sort((a,b)=>new Date(a.due)-new Date(b.due));
   const soon=D.items.filter(i=>(i.type==='homework'||i.type==='test')&&!i.done&&i.due&&(new Date(i.due)-now)>-864e5&&(new Date(i.due)-now)<6048e5).sort((a,b)=>new Date(a.due)-new Date(b.due));
-  const counts={};D.items.forEach(i=>{if(i.due){const k=dk(new Date(i.due));counts[k]=(counts[k]||0)+1}});
+  const mStart=new Date(m.getFullYear(),m.getMonth(),1),mEnd=new Date(m.getFullYear(),m.getMonth()+1,0,23,59,59);
+  const counts={};expandRange(mStart,mEnd).forEach(o=>{counts[o.key]=(counts[o.key]||0)+1});
   const today=dk(new Date());
   let cells='';for(let i=0;i<first;i++)cells+='<div></div>';
   for(let d=1;d<=days;d++){const k=dk(new Date(m.getFullYear(),m.getMonth(),d));cells+=`<button class="day${k===today?' today':''}${k===S.sel?' sel':''}" onclick="selDay('${k}')">${d}${counts[k]?`<i>${counts[k]}</i>`:''}</button>`}
-  const dayItems=D.items.filter(i=>i.due&&dk(new Date(i.due))===S.sel).sort((a,b)=>new Date(a.due)-new Date(b.due));
+  const dayItems=itemsOnDay(S.sel);
   return `<div class="home"><div class="sticky-col">
     <div class="sticky"><h3>Recent Notes</h3>${list(notes)}</div>
     <div class="sticky"><h3>Recent Recordings</h3>${list(recs)}</div>
@@ -366,7 +473,9 @@ function viewHome(){
     <div class="cal"><div class="calhead"><button onclick="moveMonth(-1)">‹</button><b>${m.toLocaleString([],{month:'long',year:'numeric'})}</b><button onclick="toggleView()">${S.view==='week'?'Month':'Week'}</button><button onclick="moveMonth(1)">›</button></div>
     <div class="wk">${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d=>`<span>${d}</span>`).join('')}</div>
     ${S.view==='week'?weekGrid():`<div class="days">${cells}</div>`}
-    <h3 class="dl">${new Date(S.sel+'T00:00').toDateString()}</h3><div class="dayList">${list(dayItems)}</div></div></div>`;
+    <h3 class="dl">${new Date(S.sel+'T00:00').toDateString()}</h3>
+    <div class="row"><button class="chip primary" onclick="openDayAdd('event')" title="Add an event on this date">+ Event</button><button class="chip" onclick="openDayAdd('homework')" title="Add homework due this date">+ Task</button><button class="chip" onclick="openDayAdd('note')" title="Add a note for this date">+ Note</button><button class="chip" onclick="openDayAdd('event',1)" title="Add an event with a reminder">+ Reminder</button></div>
+    <div class="dayList">${list(dayItems)}</div></div></div>`;
 }
 function selDay(k){S.sel=k;render()}
 function moveMonth(n){
