@@ -742,16 +742,35 @@ function openForm(type,id,pre={}){
     <option value="low" ${v.priority==='low'?'selected':''}>Low</option>
   </select></label>
   <div><b>Remind me before:</b><br>${[5,10,15,20,30,60].map(m=>`<label class="chip"><input type="checkbox" class="rem" value="${m}" ${rem.includes(m)?'checked':''}> ${m} min</label>`).join('')}</div>
-  <input id="f-custom" placeholder="Custom minutes, e.g. 45, 90">`:''}
+  <input id="f-custom" placeholder="Custom minutes, e.g. 45, 90">
+  ${(()=>{const r=v.recurrence||{freq:'none'};const iv=r.interval||1;const wd=r.weekdays||[];const mm=r.monthlyMode||'day';
+    const opt=(val2,lab,cur)=>`<option value="${val2}" ${String(cur)===String(val2)?'selected':''}>${lab}</option>`;
+    return `<div class="recbox"><b>Repeat</b>
+    <label>Frequency <select id="r-freq" onchange="recUI()">
+      ${opt('none','Does not repeat',r.freq)}${opt('daily','Daily',r.freq)}${opt('weekly','Weekly',r.freq)}${opt('monthly','Monthly',r.freq)}${opt('yearly','Yearly',r.freq)}
+    </select></label>
+    <div id="r-week" style="display:none"><b>On these days</b><div class="row">${WDAYS.map((d,ix)=>`<label class="chip"><input type="checkbox" class="r-wd" value="${ix}" ${wd.includes(ix)?'checked':''}> ${d}</label>`).join('')}</div></div>
+    <div id="r-month" style="display:none">
+      <label>Pattern <select id="r-mmode" onchange="recUI()">
+        ${opt('day','Same date each month',mm)}${opt('nth','Nth weekday of the month',mm)}
+      </select></label>
+      <div id="r-nth" style="display:none" class="row">
+        <select id="r-n">${[1,2,3,4,5].map(n=>opt(n,['1st','2nd','3rd','4th','5th'][n-1],r.nth||1)).join('')}</select>
+        <select id="r-nwd">${WDAYS.map((d,ix)=>opt(ix,d,r.nthWeekday==null?5:r.nthWeekday)).join('')}</select>
+      </div>
+    </div>
+    <label>Every <input id="r-int" type="number" min="1" value="${iv}" style="width:5em"> interval(s)</label>
+    <label>Ends on (optional) <input id="r-until" type="date" value="${r.until||''}"></label>
+    <label>Or stop after <input id="r-count" type="number" min="0" placeholder="times" value="${r.count||''}" style="width:7em"></label>
+    </div>`})()}`:''}
   ${isText?`<textarea id="f-body" placeholder="${type==='summary'?'Paste the meeting summary here':'Write here'}">${esc(v.body)}</textarea>`:''}
   <div class="row"><button class="primary" onclick="saveForm()">Save</button><button onclick="closeSheet()">Cancel</button>${ex?`<button class="danger" onclick="delItem('${ex.id}')">Delete</button>`:''}</div>`);
 }
 function saveForm(){
-  if(FORM.type==='class')return saveClass();
   const ex=FORM.id&&D.items.find(i=>i.id===FORM.id),T=FORM.type;
   const rem=[...document.querySelectorAll('.rem:checked')].map(x=>+x.value).concat(val('custom').split(',').map(s=>parseInt(s,10))).filter(n=>n>0);
   const cat=val('cat');
-  const it={id:ex?ex.id:uid(),type:T,cat,cls:(cat==='school'&&val('cls'))||null,title:val('title').trim()||LABEL[T],body:val('body'),due:val('due')||null,list:T==='bucket'?val('list'):null,priority:['low','normal','high'].includes(val('priority'))?val('priority'):'normal',reminders:[...new Set(rem)],done:ex?ex.done:false,created:ex?ex.created:Date.now()};
+  const it={id:ex?ex.id:uid(),type:T,cat,cls:(cat==='school'&&val('cls'))||null,title:val('title').trim()||LABEL[T],body:val('body'),due:val('due')||null,list:T==='bucket'?val('list'):null,priority:['low','normal','high'].includes(val('priority'))?val('priority'):'normal',reminders:[...new Set(rem)],done:ex?ex.done:false,created:ex?ex.created:Date.now(),recurrence:readRecurrence(),exceptions:ex?(ex.exceptions||[]):[],source:ex?(ex.source||'flowstate'):'flowstate',gcalId:ex?ex.gcalId||null:null,gcalCal:ex?ex.gcalCal||null:null};
   if(ex)Object.assign(ex,it);else D.items.push(it);
   save();sendGoogleSync('upsert',it);closeSheet();render();
 }
