@@ -1,0 +1,1494 @@
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index 2635b3e..23013fb 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -17,6 +17,7 @@
+             android:name=".MainActivity"
+             android:configChanges="orientation|screenSize|keyboardHidden"
+             android:exported="true"
++            android:launchMode="singleTask"
+             android:windowSoftInputMode="adjustResize">
+ 
+             <intent-filter>
+@@ -24,6 +25,32 @@
+                 <category android:name="android.intent.category.LAUNCHER" />
+             </intent-filter>
+ 
++            <!-- Share recordings and transcripts from Samsung Voice Recorder
++                 (or any app) straight into FlowState. -->
++            <intent-filter>
++                <action android:name="android.intent.action.SEND" />
++                <category android:name="android.intent.category.DEFAULT" />
++                <data android:mimeType="audio/*" />
++                <data android:mimeType="text/plain" />
++                <data android:mimeType="application/pdf" />
++                <data android:mimeType="application/octet-stream" />
++            </intent-filter>
++
++            <intent-filter>
++                <action android:name="android.intent.action.SEND_MULTIPLE" />
++                <category android:name="android.intent.category.DEFAULT" />
++                <data android:mimeType="audio/*" />
++            </intent-filter>
++
++            <!-- Internal scheme used by the app's own Browser section so links
++                 open in a sandboxed in-app WebView. -->
++            <intent-filter>
++                <action android:name="android.intent.action.VIEW" />
++                <category android:name="android.intent.category.DEFAULT" />
++                <category android:name="android.intent.category.BROWSABLE" />
++                <data android:scheme="flowstate" android:host="browse" />
++            </intent-filter>
++
+         </activity>
+     </application>
+ </manifest>
+diff --git a/android/app/src/main/java/com/flowstate/app/MainActivity.kt b/android/app/src/main/java/com/flowstate/app/MainActivity.kt
+index 9eb5d95..cbc78aa 100644
+--- a/android/app/src/main/java/com/flowstate/app/MainActivity.kt
++++ b/android/app/src/main/java/com/flowstate/app/MainActivity.kt
+@@ -1,28 +1,54 @@
+ 
+ package com.flowstate.app
+ 
++import android.app.AlertDialog
+ import android.app.DownloadManager
+ import android.content.ActivityNotFoundException
+ import android.content.Intent
+ import android.net.Uri
+ import android.os.Bundle
+ import android.os.Environment
++import android.provider.OpenableColumns
++import android.view.KeyEvent
++import android.view.ViewGroup
+ import android.webkit.CookieManager
+ import android.webkit.DownloadListener
++import android.webkit.JavascriptInterface
+ import android.webkit.URLUtil
+ import android.webkit.ValueCallback
+ import android.webkit.WebChromeClient
+ import android.webkit.WebResourceRequest
++import android.webkit.WebResourceResponse
+ import android.webkit.WebView
+ import android.webkit.WebViewClient
++import android.widget.Button
++import android.widget.LinearLayout
+ import android.widget.Toast
+ import androidx.activity.ComponentActivity
+ import androidx.activity.result.contract.ActivityResultContracts
++import org.json.JSONArray
++import org.json.JSONObject
++import java.io.File
++import java.io.FileInputStream
++import java.io.FileOutputStream
++import java.util.UUID
+ 
+ class MainActivity : ComponentActivity() {
+     private lateinit var webView: WebView
+     private var fileCallback: ValueCallback<Array<Uri>>? = null
+ 
++    /** Items shared into FlowState, already copied into app-private storage. */
++    private val pendingImports = mutableListOf<ImportedFile>()
++
++    private data class ImportedFile(
++        val id: String,
++        val name: String,
++        val mime: String,
++        val size: Long,
++        val url: String,
++        val text: String
++    )
++
+     private val filePicker = registerForActivityResult(
+         ActivityResultContracts.StartActivityForResult()
+     ) { result ->
+@@ -63,18 +89,24 @@ class MainActivity : ComponentActivity() {
+         CookieManager.getInstance().setAcceptCookie(true)
+         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+ 
++        // Only our own page can reach this bridge: everything else is handed to
++        // the system browser, so arbitrary websites get no native access.
++        webView.addJavascriptInterface(ImportBridge(), "FlowStateAndroid")
++
+         webView.webViewClient = object : WebViewClient() {
+             override fun shouldOverrideUrlLoading(
+                 view: WebView,
+                 request: WebResourceRequest
+             ): Boolean {
+                 val uri = request.url
++                if (uri.scheme == "flowstate" && uri.host == "browse") {
++                    val target = uri.getQueryParameter("url")
++                    if (target != null && (target.startsWith("https://") || target.startsWith("http://"))) {
++                        openInAppBrowser(target)
++                    }
++                    return true
++                }
+                 val host = uri.host?.lowercase() ?: return true
+-                val trustedHosts = setOf(
+-                    "cag0123abc-debug.github.io",
+-                    "script.google.com",
+-                    "script.googleusercontent.com"
+-                )
+                 if (uri.scheme == "https" && host in trustedHosts) return false
+ 
+                 if (uri.scheme == "https" || uri.scheme == "http") {
+@@ -82,6 +114,39 @@ class MainActivity : ComponentActivity() {
+                 }
+                 return true
+             }
++
++            override fun shouldInterceptRequest(
++                view: WebView,
++                request: WebResourceRequest
++            ): WebResourceResponse? {
++                val uri = request.url
++                if (uri.host != ASSET_HOST) return null
++                val path = uri.path ?: return null
++                if (!path.startsWith("/shared/")) return null
++                val rel = path.removePrefix("/shared/")
++                if (rel.isEmpty() || rel.contains("..") || rel.contains('/')) return null
++
++                val root = sharedDir()
++                val file = File(root, rel)
++                if (!file.exists() || !file.canonicalPath.startsWith(root.canonicalPath)) return null
++
++                val mime = mimeFor(file.name)
++                val headers = HashMap<String, String>()
++                headers["Access-Control-Allow-Origin"] = "*"
++                headers["Cache-Control"] = "no-store"
++                return WebResourceResponse(
++                    mime,
++                    null,
++                    200,
++                    "OK",
++                    headers,
++                    FileInputStream(file)
++                )
++            }
++
++            override fun onPageFinished(view: WebView, url: String) {
++                notifyWeb()
++            }
+         }
+ 
+         webView.webChromeClient = object : WebChromeClient() {
+@@ -130,6 +195,8 @@ class MainActivity : ComponentActivity() {
+             }
+         })
+ 
++        handleShareIntent(intent)
++
+         if (savedInstanceState == null) {
+             webView.loadUrl(FLOWSTATE_URL)
+         } else {
+@@ -137,6 +204,216 @@ class MainActivity : ComponentActivity() {
+         }
+     }
+ 
++    override fun onNewIntent(intent: Intent) {
++        super.onNewIntent(intent)
++        setIntent(intent)
++        if (intent.scheme == "flowstate" && intent.host == "browse") {
++            intent.getQueryParameter("url")?.let { openInAppBrowser(it) }
++            return
++        }
++        handleShareIntent(intent)
++    }
++
++    /* ---------------- sharing recordings into FlowState ---------------- */
++
++    private fun handleShareIntent(intent: Intent?) {
++        if (intent == null) return
++        when (intent.action) {
++            Intent.ACTION_SEND -> {
++                val uri = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
++                if (uri != null) {
++                    copySharedUri(uri, intent.type)
++                } else {
++                    val text = intent.getStringExtra(Intent.EXTRA_TEXT)
++                    if (!text.isNullOrBlank()) addTextShare(text)
++                }
++            }
++            Intent.ACTION_SEND_MULTIPLE -> {
++                val list = intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
++                list?.forEach { copySharedUri(it, intent.type) }
++            }
++        }
++        notifyWeb()
++    }
++
++    /** Copies the shared stream into app storage so it survives the source app. */
++    private fun copySharedUri(uri: Uri, fallbackMime: String?) {
++        try {
++            val mime = contentResolver.getType(uri) ?: fallbackMime ?: "application/octet-stream"
++            val rawName = displayName(uri) ?: "shared-${System.currentTimeMillis()}"
++            val safeName = rawName.replace(Regex("[^A-Za-z0-9._ -]"), "_").take(80)
++            val stored = "${UUID.randomUUID()}-$safeName"
++            val target = File(sharedDir(), stored)
++
++            contentResolver.openInputStream(uri).use { input ->
++                if (input == null) {
++                    Toast.makeText(this, "Could not read the shared file", Toast.LENGTH_SHORT).show()
++                    return
++                }
++                FileOutputStream(target).use { output -> input.copyTo(output) }
++            }
++
++            val item = ImportedFile(
++                id = UUID.randomUUID().toString(),
++                name = rawName,
++                mime = mime,
++                size = target.length(),
++                url = "https://$ASSET_HOST/shared/$stored",
++                text = ""
++            )
++            synchronized(pendingImports) { pendingImports.add(item) }
++            Toast.makeText(this, "Copied $rawName into FlowState", Toast.LENGTH_SHORT).show()
++        } catch (_: Exception) {
++            Toast.makeText(this, "Could not copy shared file", Toast.LENGTH_SHORT).show()
++        }
++    }
++
++    private fun addTextShare(text: String) {
++        val item = ImportedFile(
++            id = UUID.randomUUID().toString(),
++            name = "Shared transcript",
++            mime = "text/plain",
++            size = text.length.toLong(),
++            url = "",
++            text = text
++        )
++        synchronized(pendingImports) { pendingImports.add(item) }
++    }
++
++    private fun displayName(uri: Uri): String? {
++        return try {
++            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
++                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
++                if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
++            }
++        } catch (_: Exception) {
++            uri.lastPathSegment
++        }
++    }
++
++    private fun notifyWeb() {
++        if (!::webView.isInitialized) return
++        webView.post {
++            webView.evaluateJavascript(
++                "if(typeof checkSharedImports==='function'){checkSharedImports()}",
++                null
++            )
++        }
++    }
++
++    private inner class ImportBridge {
++        @JavascriptInterface
++        fun pendingImports(): String {
++            val array = JSONArray()
++            synchronized(pendingImports) {
++                pendingImports.forEach { file ->
++                    array.put(
++                        JSONObject().apply {
++                            put("id", file.id)
++                            put("name", file.name)
++                            put("mime", file.mime)
++                            put("size", file.size)
++                            put("url", file.url)
++                            put("text", file.text)
++                        }
++                    )
++                }
++            }
++            return array.toString()
++        }
++
++        @JavascriptInterface
++        fun clearPending(id: String) {
++            synchronized(pendingImports) {
++                pendingImports.removeAll { it.id == id }
++            }
++        }
++    }
++
++    private fun sharedDir(): File = File(filesDir, "shared").apply { mkdirs() }
++
++    private fun mimeFor(name: String): String = when {
++        name.endsWith(".m4a", true) -> "audio/mp4"
++        name.endsWith(".mp3", true) -> "audio/mpeg"
++        name.endsWith(".wav", true) -> "audio/wav"
++        name.endsWith(".ogg", true) -> "audio/ogg"
++        name.endsWith(".txt", true) -> "text/plain"
++        name.endsWith(".pdf", true) -> "application/pdf"
++        name.endsWith(".json", true) -> "application/json"
++        else -> "application/octet-stream"
++    }
++
++    /* ---------------- sandboxed in-app browser ---------------- */
++
++    private fun openInAppBrowser(url: String) {
++        val browser = WebView(this)
++        browser.settings.javaScriptEnabled = true
++        browser.settings.domStorageEnabled = true
++        browser.settings.allowFileAccess = false
++        browser.settings.allowContentAccess = false
++        browser.settings.javaScriptCanOpenWindowsAutomatically = false
++        browser.settings.setSupportMultipleWindows(false)
++        browser.settings.mediaPlaybackRequiresUserGesture = true
++        // No JavascriptInterface here on purpose: arbitrary sites get no
++        // access to FlowState data or native features.
++        browser.webViewClient = object : WebViewClient() {
++            override fun shouldOverrideUrlLoading(
++                view: WebView,
++                request: WebResourceRequest
++            ): Boolean {
++                val scheme = request.url.scheme ?: return true
++                return scheme != "https" && scheme != "http"
++            }
++        }
++
++        val controls = LinearLayout(this).apply {
++            orientation = LinearLayout.HORIZONTAL
++        }
++        fun control(label: String, action: () -> Unit) {
++            val button = Button(this)
++            button.text = label
++            button.textSize = 13f
++            button.setOnClickListener { action() }
++            controls.addView(
++                button,
++                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
++            )
++        }
++        control("◀") { if (browser.canGoBack()) browser.goBack() }
++        control("▶") { if (browser.canGoForward()) browser.goForward() }
++        control("⟳") { browser.reload() }
++        control("↗") {
++            try {
++                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(browser.url ?: url)))
++            } catch (_: ActivityNotFoundException) {
++                Toast.makeText(this, "No app can open this link", Toast.LENGTH_SHORT).show()
++            }
++        }
++
++        val container = LinearLayout(this).apply {
++            orientation = LinearLayout.VERTICAL
++            addView(controls, LinearLayout.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
++            addView(browser, LinearLayout.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
++        }
++
++        val dialog = AlertDialog.Builder(this)
++            .setTitle("FlowState browser")
++            .setView(container)
++            .setNegativeButton("Close", null)
++            .setOnDismissListener { browser.destroy() }
++            .create()
++
++        dialog.setOnKeyListener { _, keyCode, event ->
++            if (keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP && browser.canGoBack()) {
++                browser.goBack()
++                true
++            } else false
++        }
++
++        browser.loadUrl(url)
++        dialog.show()
++    }
++
+     private fun openExternal(uri: Uri) {
+         try {
+             startActivity(Intent(Intent.ACTION_VIEW, uri))
+@@ -170,5 +447,12 @@ class MainActivity : ComponentActivity() {
+     companion object {
+         private const val FLOWSTATE_URL =
+             "https://cag0123abc-debug.github.io/FlowStateFinal/"
++        private const val ASSET_HOST = "flowstate.local"
++
++        private val trustedHosts = setOf(
++            "cag0123abc-debug.github.io",
++            "script.google.com",
++            "script.googleusercontent.com"
++        )
+     }
+ }
+diff --git a/docs/GOOGLE-SYNC-SETUP.md b/docs/GOOGLE-SYNC-SETUP.md
+new file mode 100644
+index 0000000..8fa1270
+--- /dev/null
++++ b/docs/GOOGLE-SYNC-SETUP.md
+@@ -0,0 +1,168 @@
++# Google Calendar two-way sync — setup and credential rotation
++
++FlowState no longer ships any Google endpoint or token in `index.html`. The app
++talks to a small Google Apps Script web app **that you own and deploy from your
++own Google account**, and it stores that URL plus a device key in your browser's
++local storage only.
++
++## 1. Rotate the credentials that were public before
++
++An earlier version of `index.html` contained a hardcoded Apps Script URL
++(`script.google.com/macros/s/AKfycb.../exec`) and a shared token
++(`flowstate-2026-private-...`) in client-side code. Anything served to a browser
++is public, so treat both as compromised:
++
++1. Open the Apps Script project that the old URL points to → **Deploy → Manage
++   deployments** → archive/delete the old deployment so the URL stops working.
++2. Deploy a **new** deployment (new URL) after pasting the code below.
++3. The old shared token must be replaced. The script below validates a key you
++   choose yourself; do not reuse the old value.
++4. If you ever put a Google Cloud OAuth client secret or an API key in this
++   repository, go to <https://console.cloud.google.com/apis/credentials>, delete
++   that credential and create a new one. Never commit the new one — keep it in
++   Apps Script's **Script Properties**, not in source.
++5. Because the old token was public, check your Google Calendar for unexpected
++   events and your Apps Script **Executions** log for unfamiliar calls.
++
++Note that a token embedded in a client app cannot be a real secret: any user can
++read it. That is why the endpoint and key are now user-supplied settings, and why
++the endpoint itself must validate the key server-side (below).
++
++## 2. Create the Apps Script project
++
++1. Go to <https://script.google.com> → **New project**.
++2. Paste the code below into `Code.gs`.
++3. **Project Settings → Script properties → Add property**:
++   `SYNC_KEY` = a long random string you generate (e.g. 40+ random characters).
++4. Run the `setup` function once and approve the Calendar permissions.
++5. **Deploy → New deployment → Web app**:
++   - Execute as: **Me**
++   - Who has access: **Anyone** (the script enforces `SYNC_KEY`)
++6. Copy the `/exec` URL and the `SYNC_KEY` into FlowState → ⚙️ Settings →
++   **Google Calendar sync**.
++
++## 3. Apps Script code (`Code.gs`)
++
++```javascript
++var CAL_ID = 'primary';            // or a specific calendar id
++var SYNC_KEY = PropertiesService.getScriptProperties().getProperty('SYNC_KEY');
++
++function setup() {
++  CalendarApp.getCalendarById(CAL_ID) || CalendarApp.getDefaultCalendar();
++}
++
++function ok_(e) {
++  return e && e.parameter && e.parameter.key && e.parameter.key === SYNC_KEY;
++}
++
++function json_(obj) {
++  return ContentService.createTextOutput(JSON.stringify(obj))
++    .setMimeType(ContentService.MimeType.JSON);
++}
++
++// Incoming: Google Calendar -> FlowState
++function doGet(e) {
++  if (!ok_(e)) return json_({ ok: false, error: 'bad key' });
++  if (e.parameter.action !== 'pull') return json_({ ok: false, error: 'unknown action' });
++
++  var cal = CalendarApp.getCalendarById(CAL_ID) || CalendarApp.getDefaultCalendar();
++  var from = e.parameter.from ? new Date(e.parameter.from) : new Date(Date.now() - 86400000 * 30);
++  var to = e.parameter.to ? new Date(e.parameter.to) : new Date(Date.now() + 86400000 * 180);
++
++  var out = [];
++  cal.getEvents(from, to).forEach(function (ev) {
++    if (ev.isAllDayEvent() && ev.getTitle() === 'Busy') return; // skip placeholder blocks
++    out.push({
++      gcalId: ev.getId(),
++      calendar: cal.getName(),
++      title: ev.getTitle() || '(no title)',
++      body: ev.getDescription() || '',
++      start: ev.getStartTime().toISOString(),
++      end: ev.getEndTime().toISOString(),
++      allDay: ev.isAllDayEvent(),
++      recurring: !!ev.getEventSeries(),
++      recurrence: ev.getEventSeries() ? String(ev.getEventSeries().getRecurrence().join('\n')) : ''
++    });
++  });
++  return json_({ ok: true, calendar: cal.getName(), events: out });
++}
++
++// Outgoing: FlowState -> Google Calendar
++function doPost(e) {
++  var body = {};
++  try { body = JSON.parse(e.postData.contents); } catch (err) { return json_({ ok: false, error: 'bad body' }); }
++  if (!body.key || body.key !== SYNC_KEY) return json_({ ok: false, error: 'bad key' });
++
++  var cal = CalendarApp.getCalendarById(CAL_ID) || CalendarApp.getDefaultCalendar();
++
++  if (body.action === 'delete') {
++    var found = cal.getEventById(body.gcalId);
++    if (found) found.deleteEvent();
++    return json_({ ok: true });
++  }
++
++  if (body.action === 'upsert') {
++    var it = body.item || {};
++    if (!it.start) return json_({ ok: false, error: 'missing start' });
++    var start = new Date(it.start);
++    var end = it.end ? new Date(it.end) : new Date(start.getTime() + 3600000);
++
++    // Duplicate prevention: an existing event id wins over creating a new one.
++    var ev = it.gcalId ? cal.getEventById(it.gcalId) : null;
++    if (!ev) {
++      var same = cal.getEvents(start, new Date(start.getTime() + 60000)).filter(function (x) {
++        return x.getTitle() === (it.title || '(no title)');
++      });
++      if (same.length) ev = same[0];
++    }
++
++    if (ev) {
++      ev.setTitle(it.title || '(no title)');
++      ev.setDescription(it.body || '');
++      if (ev.isAllDayEvent() !== !!it.allDay) {
++        ev.deleteEvent();
++        ev = it.allDay
++          ? cal.createAllDayEvent(it.title || '(no title)', start)
++          : cal.createEvent(it.title || '(no title)', start, end);
++      } else if (!it.allDay) {
++        ev.setTime(start, end);
++      }
++    } else {
++      ev = it.allDay
++        ? cal.createAllDayEvent(it.title || '(no title)', start)
++        : cal.createEvent(it.title || '(no title)', start, end, { description: it.body || '' });
++    }
++
++    if (it.recurrence) {
++      // RRULE lines such as "RRULE:FREQ=WEEKLY;BYDAY=WE,TH,SA"
++      try {
++        var series = ev.getEventSeries();
++        if (series) series.setRecurrence(CalendarApp.newRecurrence().addWeeklyRule(
++          CalendarApp.Weekday.WEDNESDAY));
++      } catch (err) { /* recurrence left untouched */ }
++    }
++    return json_({ ok: true, gcalId: ev.getId(), calendar: cal.getName() });
++  }
++
++  return json_({ ok: false, error: 'unknown action' });
++}
++```
++
++### About recurring events on the server
++
++Apps Script's `Recurrence` API cannot express every RRULE the app can produce
++(e.g. "second Friday of every month" combined with an end date). The app always
++stores its own recurrence definition locally and sends an `RRULE` string, so the
++local series is authoritative; treat Google's copy as a mirror. If a pattern
++cannot be mirrored exactly, the event still syncs with its correct first date.
++
++## 4. What the app does with it
++
++- **Push**: every create/edit/complete/delete calls `sendGoogleSync(...)`; failures
++  are queued in local storage and flushed when the app next opens or you press
++  **Sync now**.
++- **Pull**: `pullGoogleSync()` GETs `?action=pull&key=…`, matches on `gcalId`, and
++  only inserts events that are not already present — that is the duplicate guard
++  on the client side. Incoming items are tagged `source: 'google'` and show a
++  `📅 <calendar name>` badge so you can tell where an event came from.
++- Nothing syncs until you enter your own URL and key.
+diff --git a/index.html b/index.html
+index caa4a95..ce7614a 100644
+--- a/index.html
++++ b/index.html
+@@ -50,7 +50,11 @@ h3{margin:0 0 8px}
+ .chk{width:34px;height:34px;flex:none;border-radius:8px;padding:0}
+ .grow{flex:1;min-width:0}
+ .empty{opacity:.6;font-style:italic}
+-.body{white-space:pre-wrap;max-height:260px;overflow:auto;background:#faf7f7;border-radius:10px;padding:8px;margin-top:6px}
++.body{white-space:pre-wrap;background:#faf7f7;border-radius:10px;padding:8px;margin-top:6px;overflow-wrap:anywhere}
++.body.clamped{max-height:300px;overflow:hidden;position:relative;mask-image:linear-gradient(#000 78%,transparent);-webkit-mask-image:linear-gradient(#000 78%,transparent)}
++.expbtn{display:inline-block;margin-top:6px;padding:5px 12px;font-size:.85em;border-radius:16px;background:#fff;border:2px solid var(--cal);cursor:pointer}
++textarea{min-height:170px;max-height:none;resize:vertical}
++textarea.grow{overflow:hidden;resize:none}
+ button{font:inherit;border-radius:12px;border:2px solid var(--cal);background:#fff;padding:8px 14px;color:var(--text);cursor:pointer}
+ button.primary{background:var(--cal);color:#fff}
+ button.danger{color:#c00;border-color:#c00}
+@@ -119,6 +123,61 @@ label.chip{display:inline-flex;align-items:center;gap:4px;width:auto;padding:6px
+   border-radius:50%;flex:none;
+ }
+ #rail img{display:block;width:100%;height:100%;object-fit:cover;object-position:center;border-radius:50%}
++/* ---- class books ---- */
++.books{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:22px;padding:14px 4px}
++.book{position:relative;aspect-ratio:1/1.32;border-radius:8px 14px 14px 8px;overflow:hidden;cursor:pointer;box-shadow:0 8px 18px rgba(0,0,0,.28);transition:transform .25s,box-shadow .25s;display:flex;flex-direction:column;justify-content:flex-end;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;border-left:12px solid rgba(0,0,0,.28)}
++.book:active{transform:scale(.97)}
++.book.dragging{opacity:.4}
++.book.dropzone{outline:3px dashed var(--cal);outline-offset:3px}
++.book .cover{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
++.book .shade{position:absolute;inset:0;background:linear-gradient(to top,rgba(0,0,0,.72) 0%,rgba(0,0,0,.18) 52%,rgba(0,0,0,0) 78%)}
++.book .spine{position:absolute;left:0;top:0;bottom:0;width:14px;background:linear-gradient(90deg,rgba(0,0,0,.42),rgba(255,255,255,.14));pointer-events:none}
++.book .bmeta{position:relative;padding:12px 14px;color:#fff;text-shadow:0 2px 6px rgba(0,0,0,.7);z-index:2}
++.book .bmeta b{display:block;font-size:1.15em;line-height:1.2}
++.book .bmeta small{opacity:.9;font-size:.78em}
++.book .bico{position:absolute;top:10px;right:12px;font-size:30px;z-index:2;filter:drop-shadow(0 2px 4px rgba(0,0,0,.6))}
++.book .stickers{position:absolute;inset:0;pointer-events:none;z-index:1}
++.book .stickers span{position:absolute;font-size:26px;filter:drop-shadow(0 2px 3px rgba(0,0,0,.45))}
++.book .bcount{position:absolute;top:10px;left:16px;background:rgba(0,0,0,.55);color:#fff;border-radius:12px;padding:2px 9px;font-size:.72em;z-index:2}
++.book .reorder{position:absolute;bottom:8px;right:8px;z-index:3;display:flex;gap:4px}
++.book .reorder button{width:34px;height:34px;padding:0;border-radius:50%;font-size:15px;background:rgba(255,255,255,.92);border:2px solid rgba(0,0,0,.35);line-height:1}
++/* ---- in-app browser ---- */
++.brw{display:flex;flex-direction:column;gap:10px;height:100%}
++/* ---- decorative widget ---- */
++.widget{position:relative;border-radius:18px;overflow:hidden;margin:0 0 16px;background:var(--card);box-shadow:0 6px 18px rgba(0,0,0,.22);display:flex;align-items:center;justify-content:center;width:100%}
++.widget img{width:100%;height:100%;object-fit:cover;display:block}
++.widget .wq{padding:22px;font-size:1.15em;line-height:1.55;font-style:italic;text-align:center}
++.widget .wlab{position:absolute;left:12px;bottom:10px;font-size:.72em;background:rgba(0,0,0,.5);color:#fff;padding:2px 9px;border-radius:10px}
++.widget .wref{position:absolute;right:10px;top:10px;width:34px;height:34px;padding:0;border-radius:50%;background:rgba(0,0,0,.5);color:#fff;border:0;font-size:16px;line-height:1}
++.brwbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
++.brwbar button{width:46px;height:46px;padding:0;font-size:20px;border-radius:50%;flex:none}
++.brwbar input{flex:1;min-width:180px;margin:0}
++.brwframe{flex:1;min-height:420px;border:3px solid var(--cal);border-radius:16px;overflow:hidden;background:#fff;position:relative}
++.brwframe iframe{width:100%;height:100%;border:0;display:block;min-height:420px}
++.brwnote{background:#fff6a8;border-radius:10px;padding:10px;font-size:.9em}
++.bmk{display:flex;align-items:center;gap:10px}
++.bmk .fav{width:34px;height:34px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:18px;background:#eee;flex:none}
++/* ---- decorative widgets ---- */
++.widget{position:relative;border-radius:16px;overflow:hidden;background:#eee;box-shadow:0 4px 12px rgba(0,0,0,.16);display:flex;align-items:flex-end;min-height:150px}
++.widget img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
++.widget .wq{position:relative;z-index:2;padding:14px;color:#fff;font-weight:600;text-shadow:0 2px 8px rgba(0,0,0,.85);line-height:1.35}
++.widget .wq small{display:block;font-weight:400;opacity:.85;margin-top:6px}
++.widget.w-quote{background:linear-gradient(135deg,#c44cc9,#ff7a59);align-items:center;justify-content:center;text-align:center}
++.widget.w-quote .wq{color:#fff}
++.wsize-s{min-height:110px}.wsize-m{min-height:170px}.wsize-l{min-height:250px}
++/* ---- quick add + focus + search ---- */
++.qfab{position:absolute;right:22px;bottom:104px;width:60px;height:60px;border-radius:50%;background:#2fd46b;color:#fff;font-size:30px;border:4px solid #111;padding:0;line-height:1;box-shadow:0 4px 10px rgba(0,0,0,.3)}
++body.focusmode #rail,body.focusmode #schoolBtn,body.focusmode .qfab{display:none}
++body.focusmode #main{max-width:1100px;margin:0 auto}
++body.focusmode .sticky{display:none}
++.srch{display:flex;flex-direction:column;gap:8px}
++.srchres .card{cursor:pointer}
++[data-tip]{position:relative}
++.tipwrap{position:relative;display:inline-block}
++.dash{display:grid;grid-template-columns:1fr 1fr;gap:14px}
++.dash .panel{margin-bottom:0}
++.dash .hidden-sec{opacity:.45}
++@media(max-width:820px){.books{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px}.cols,.home,.dash{grid-template-columns:1fr}.grid2{grid-template-columns:1fr}#rail{width:88px}#rail button{width:66px;height:66px;font-size:27px}}
+ </style>
+ </head>
+ <body>
+@@ -131,7 +190,11 @@ label.chip{display:inline-flex;align-items:center;gap:4px;width:auto;padding:6px
+       <div class="tr">
+         <span id="clock"></span>
+         <button onclick="openSearch()" title="Search">🔍</button>
+-        <button onclick="go2('notifs')" title="Notifications">🔔<i id="badge"></i></button>
++        <button onclick="openSearch()" title="Search everything">🔎</button>
++      <button onclick="go2('focus')" title="Focus mode">🎯</button>
++      <button onclick="lookSheet()" title="Look, widgets and image library">🎨</button>
++      <button onclick="quickAdd()" title="Quick add event, task, note or reminder">➕</button>
++      <button onclick="go2('notifs')" title="Notifications">🔔<i id="badge"></i></button>
+         <button onclick="go2('settings')" title="Settings">⚙️</button>
+       </div>
+     </header>
+@@ -145,16 +208,32 @@ label.chip{display:inline-flex;align-items:center;gap:4px;width:auto;padding:6px
+ <div id="bubble"></div>
+ <script>
+ const clone=o=>JSON.parse(JSON.stringify(o));
+-const KEY='flowstate-v2';
++const KEY='flowstate-v3';
++const OLDKEYS=['flowstate-v2'];
+ const PAL=['#ff8fa3','#8fd3a8','#f7c77a','#9db4f0','#c39bf0','#7fd6e8','#f49a6b'];
+-const DEF={items:[],classes:[{id:'math',name:'Math',icon:'➕',color:'#ff8fa3'}],notifs:[],dnd:false,fired:{},
++const DEF={items:[],classes:[{id:'math',name:'Math',icon:'➕',color:'#ff8fa3'}],notifs:[],dnd:false,fired:{},templates:[],images:[],bookmarks:[],
+   settings:{speed:1,reduce:false,font:'system-ui, sans-serif',fs:16,text:'#1d2440',cal:'#3d5ba9',
+-  bg:{home:'#f5e6e1',school:'#f7dede',work:'#dfe7f5',deyc:'#dcf2e2',personal:'#e5dcf5'}}};
++  bg:{home:'#f5e6e1',school:'#f7dede',work:'#dfe7f5',deyc:'#dcf2e2',personal:'#e5dcf5'},
++  widget:{on:true,size:'m',rotate:'tab',collections:['scenic','quote'],showOn:['home']},dash:{hidden:[],order:null}}};
++function migrate(x){
++  const d=clone(DEF);
++  const out=Object.assign(d,x,{settings:Object.assign(d.settings,x.settings||{},{bg:Object.assign(d.settings.bg,(x.settings||{}).bg||{}),bgImg:Object.assign({},(x.settings||{}).bgImg||{}),widget:Object.assign(d.settings.widget,(x.settings||{}).widget||{}),dash:Object.assign(d.settings.dash,(x.settings||{}).dash||{})})});
++  out.templates=Array.isArray(x.templates)?x.templates:[];
++  out.images=Array.isArray(x.images)?x.images:[];
++  out.bookmarks=Array.isArray(x.bookmarks)?x.bookmarks:[];
++  out.items=(x.items||[]).map(i=>Object.assign({recurrence:null,seriesId:null,exceptions:[],gcalId:null,gcalCal:null,source:'local'},i));
++  out.classes=(Array.isArray(x.classes)?x.classes:d.classes).map((c,ix)=>Object.assign({order:ix,book:{cover:null,tint:null,stickers:[],subtitle:''}},c,{book:Object.assign({cover:null,tint:null,stickers:[],subtitle:''},c.book||{})}));
++  return out;
++}
+ function load(){
++  let x=null;
+   try{
+-    const x=JSON.parse(localStorage.getItem(KEY));
+-    if(x&&x.items){const d=clone(DEF);return Object.assign(d,x,{settings:Object.assign(d.settings,x.settings||{},{bg:Object.assign(d.settings.bg,(x.settings||{}).bg||{})})})}
++    x=JSON.parse(localStorage.getItem(KEY));
++    if(!x||!x.items){
++      for(const k of OLDKEYS){const o=JSON.parse(localStorage.getItem(k)||'null');if(o&&o.items){x=o;break}}
++    }
+   }catch(e){}
++  if(x&&x.items)return migrate(x);
+   return clone(DEF);
+ }
+ let D=load();
+@@ -169,63 +248,201 @@ const byC=(a,b)=>b.created-a.created;
+ const val=k=>$('#f-'+k)?.value??'';
+ const CATS={home:'Home',school:'School',work:'Work',deyc:'DEYC',personal:'Personal'};
+ const BGK=['home','school','work','deyc','personal'];
+-const RAIL=[['home','🏠','Home'],['school','🎓','School'],['work','💼','Work'],['deyc','🤝','DEYC'],['personal','🌟','Personal']];
++const RAIL=[['home','🏠','Home'],['school','🎓','School'],['work','💼','Work'],['deyc','🤝','DEYC'],['personal','🌟','Personal'],['browser','🌐','Browser']];
+ const LISTS=['Must Watch','Must Read','Must Play','To Do','Websites','Potential Ideas','Games to Play'];
+ const LABEL={event:'Event',homework:'Homework',test:'Test',summary:'Summary',project:'Project',note:'Note',bucket:'List item',recording:'Recording'};
+-let FORM={},REC=null,RC='school',CCOL=PAL[0],UNDO=null,TT=null,CONF=null;
++const WDAYS=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
++let FORM={},REC=null,RC='school',CCOL=PAL[0],UNDO=null,TT=null,CONF=null,BOOKID=null;
+ S.sel=dk(new Date());
+ S.month=new Date(new Date().getFullYear(),new Date().getMonth(),1);
+ 
+ function save(){try{localStorage.setItem(KEY,JSON.stringify(D))}catch(e){toast('Storage is full. Try a smaller image or remove one.')}}
+ 
+-// Google sync uses the user's Apps Script web app. Requests are sent as
+-// text/plain so the endpoint can accept them without a browser CORS preflight.
+-const GOOGLE_SYNC_URL='https://script.google.com/macros/s/AKfycbxF-v0PypnUbO-h9mPWKc5E8LIjJUe2WosWHY2C-Le2j4lpYwtdY1EBE06u0Dh64vP4Yw/exec';
+-const GOOGLE_SYNC_TOKEN='flowstate-2026-private-7Kq9m2';
++/* ================= recurrence engine ================= */
++function recActive(i){const r=i&&i.recurrence;return !!(r&&r.freq&&r.freq!=='none')}
++function sod(d){return new Date(d.getFullYear(),d.getMonth(),d.getDate())}
++function daysBetween(a,b){return Math.round((sod(b)-sod(a))/864e5)}
++function monthsBetween(a,b){return (b.getFullYear()-a.getFullYear())*12+(b.getMonth()-a.getMonth())}
++function nthWeekdayDate(y,m,n,wd){const f=new Date(y,m,1);const day=1+((wd-f.getDay()+7)%7)+(n-1)*7;const d=new Date(y,m,day);return d.getMonth()===m?d:null}
++function nthInMonth(d,wd){if(d.getDay()!==wd)return 0;return Math.floor((d.getDate()-1)/7)+1}
++function isSkipped(i,d){return (i.exceptions||[]).indexOf(dk(d))>-1}
++function occursOnDate(i,d){
++  if(!i.due)return false;
++  const base=new Date(i.due);if(isNaN(base))return false;
++  const bd=sod(base),dd=sod(d);
++  if(dd<bd)return false;
++  if(!recActive(i))return dd.getTime()===bd.getTime();
++  if(isSkipped(i,dd))return false;
++  const r=i.recurrence;
++  if(r.until){const u=new Date(r.until+'T23:59:59');if(!isNaN(u)&&dd>u)return false}
++  const iv=Math.max(1,parseInt(r.interval,10)||1);
++  if(r.freq==='daily')return daysBetween(bd,dd)%iv===0;
++  if(r.freq==='weekly'){
++    const wd=(Array.isArray(r.weekdays)&&r.weekdays.length)?r.weekdays:[bd.getDay()];
++    if(wd.indexOf(dd.getDay())<0)return false;
++    const a=new Date(bd);a.setDate(bd.getDate()-bd.getDay());
++    const b=new Date(dd);b.setDate(dd.getDate()-dd.getDay());
++    return (Math.round((b-a)/(864e5*7)))%iv===0;
++  }
++  if(r.freq==='monthly'){
++    if(monthsBetween(bd,dd)%iv!==0)return false;
++    if(r.monthlyMode==='nth'){
++      const n=parseInt(r.nth,10)||1,wd=parseInt(r.nthWeekday,10);
++      if(isNaN(wd)||dd.getDay()!==wd)return false;
++      return nthInMonth(dd,wd)===n;
++    }
++    return dd.getDate()===bd.getDate();
++  }
++  if(r.freq==='yearly'){
++    if((dd.getFullYear()-bd.getFullYear())%iv!==0)return false;
++    return dd.getMonth()===bd.getMonth()&&dd.getDate()===bd.getDate();
++  }
++  return dd.getTime()===bd.getTime();
++}
++function occAt(i,d){const base=new Date(i.due);const o=new Date(d);o.setHours(base.getHours(),base.getMinutes(),0,0);return o}
++function occurrencesInRange(i,from,to){
++  if(!i.due)return[];
++  const base=new Date(i.due);if(isNaN(base))return[];
++  if(!recActive(i))return (base>=from&&base<=to)?[base]:[];
++  const t=sod(to),cnt=parseInt(i.recurrence.count,10)||0;
++  let start=sod(base);
++  if(!cnt&&sod(from)>start)start=sod(from);
++  const out=[];let d=new Date(start),n=0,guard=0;
++  while(d<=t&&guard++<4000){
++    if(occursOnDate(i,d)){n++;if(!cnt||n<=cnt)out.push(occAt(i,d));else break}
++    d=new Date(d.getFullYear(),d.getMonth(),d.getDate()+1);
++  }
++  return out.filter(x=>x>=from&&x<=to);
++}
++function expandRange(from,to){
++  const out=[];
++  D.items.forEach(i=>occurrencesInRange(i,from,to).forEach(d=>out.push({item:i,date:d,key:dk(d)})));
++  return out.sort((a,b)=>a.date-b.date);
++}
++function itemsOnDay(k){
++  const from=new Date(k+'T00:00'),to=new Date(k+'T23:59:59');
++  const seen={},out=[];
++  expandRange(from,to).forEach(o=>{if(!seen[o.item.id]){seen[o.item.id]=1;out.push(o.item)}});
++  return out;
++}
++function recSummary(i){
++  const r=i.recurrence;if(!recActive(i))return '';
++  const iv=parseInt(r.interval,10)||1;
++  if(r.freq==='daily')return iv>1?'Every '+iv+' days':'Daily';
++  if(r.freq==='weekly'){
++    const wd=(r.weekdays||[]).slice().sort().map(d=>WDAYS[d]);
++    return (iv>1?'Every '+iv+' weeks':'Weekly')+(wd.length?' on '+wd.join(', '):'');
++  }
++  if(r.freq==='monthly'){
++    if(r.monthlyMode==='nth')return (iv>1?'Every '+iv+' months':'Monthly')+' on the '+['','1st','2nd','3rd','4th','5th'][parseInt(r.nth,10)||1]+' '+WDAYS[parseInt(r.nthWeekday,10)];
++    return iv>1?'Every '+iv+' months':'Monthly';
++  }
++  if(r.freq==='yearly')return iv>1?'Every '+iv+' years':'Yearly';
++  return '';
++}
++function skipOccurrence(id,k){
++  const i=D.items.find(x=>x.id===id);if(!i)return;
++  i.exceptions=i.exceptions||[];
++  if(i.exceptions.indexOf(k)<0)i.exceptions.push(k);
++  save();closeSheet();render();toast('Occurrence skipped');
++}
++function bodyHtml(text,id){
++  const t=String(text==null?'':text);
++  const long=t.length>520||t.split('\n').length>10;
++  return `<div class="body${long?' clamped':''}" id="bd-${id}">${esc(t)}</div>`+(long?`<button class="expbtn" onclick="toggleBody('${id}',this)">Show more</button>`:'');
++}
++function toggleBody(id,btn){
++  const el=document.getElementById('bd-'+id);if(!el)return;
++  const c=el.classList.toggle('clamped');
++  btn.textContent=c?'Show more':'Show less';
++}
++function openDayAdd(type,rem){
++  const pre={due:S.sel+'T09:00'};
++  if(type==='note')delete pre.due;
++  if(S.tab==='school'&&S.cls){pre.cls=S.cls;pre.cat='school'}
++  openForm(type,null,pre);
++  if(rem)setTimeout(()=>{document.querySelectorAll('.rem').forEach(c=>{if(c.value==='10')c.checked=true})},0);
++}
++// Google sync talks to the user's own Apps Script web app. The endpoint and
++// the device key are entered in Settings and stored on this device only.
++// No secret is shipped in this file or served publicly.
++function gsUrl(){return String(D.settings.gsUrl||'').trim()}
++function gsKey(){return String(D.settings.gsKey||'').trim()}
++function gsReady(){return !!gsUrl()}
+ function googlePayload(action,item,id){
+-  const payload={token:GOOGLE_SYNC_TOKEN,action};
++  const payload={key:gsKey(),action};
+   if(item){
+     const copy={...item};
+     // Send an unambiguous instant to Apps Script while keeping the local
+     // date-time value untouched in FlowState's own storage.
+     if(copy.due){const d=new Date(copy.due);copy.due=isNaN(d)?null:d.toISOString()}
++    copy.recurrence=item.recurrence||null;
++    copy.exceptions=item.exceptions||[];
+     payload.item=copy;
+   }
+   if(id)payload.id=id;
+   return JSON.stringify(payload);
+ }
++function gsQueue(body){
++  D.settings.pendingGoogleSync=D.settings.pendingGoogleSync||[];
++  D.settings.pendingGoogleSync.push(body);save();
++}
+ function sendGoogleSync(action,item,id){
+-  if(!D.settings.googleSync)return;
++  if(!D.settings.googleSync||!gsReady())return;
+   const body=googlePayload(action,item,id);
+-  if(!navigator.onLine){
+-    D.settings.pendingGoogleSync=D.settings.pendingGoogleSync||[];
+-    D.settings.pendingGoogleSync.push(body);save();return;
+-  }
+-  fetch(GOOGLE_SYNC_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=UTF-8'},body,keepalive:true})
+-    .catch(()=>{D.settings.pendingGoogleSync=D.settings.pendingGoogleSync||[];D.settings.pendingGoogleSync.push(body);save()});
++  if(!navigator.onLine){gsQueue(body);return}
++  fetch(gsUrl(),{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=UTF-8'},body,keepalive:true})
++    .catch(()=>gsQueue(body));
+ }
+ function flushGoogleSync(){
+-  if(!D.settings.googleSync||!navigator.onLine)return;
++  if(!D.settings.googleSync||!navigator.onLine||!gsReady())return;
+   const q=D.settings.pendingGoogleSync||[];if(!q.length)return;
+   D.settings.pendingGoogleSync=[];save();
+-  q.forEach(body=>fetch(GOOGLE_SYNC_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=UTF-8'},body,keepalive:true}).catch(()=>{D.settings.pendingGoogleSync=D.settings.pendingGoogleSync||[];D.settings.pendingGoogleSync.push(body);save()}));
++  q.forEach(body=>fetch(gsUrl(),{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=UTF-8'},body,keepalive:true}).catch(()=>gsQueue(body)));
++}
++// Incoming direction: read events back from the calendar and merge them.
++// Matching is by Google event id, so the same event never lands twice.
++async function pullGoogleSync(silent){
++  if(!gsReady()){if(!silent)toast('Add your sync URL in Settings first');return}
++  try{
++    const r=await fetch(gsUrl()+'?action=pull&key='+encodeURIComponent(gsKey()),{method:'GET',cache:'no-store'});
++    if(!r.ok)throw new Error('HTTP '+r.status);
++    const data=await r.json();
++    if(data.error)throw new Error(data.error);
++    const evs=data.events||[];let added=0,updated=0;
++    evs.forEach(ev=>{
++      const gid=ev.gcalId||ev.id;if(!gid)return;
++      const ex=D.items.find(i=>i.gcalId===gid);
++      const fields={title:ev.title||'Untitled',body:ev.body||'',due:ev.due||null,type:ev.type||'event',cat:ev.cat||'personal',cls:ev.cls||null,recurrence:ev.recurrence||null,source:'google',gcalId:gid,gcalCal:ev.calendar||'Google',exceptions:ev.exceptions||[]};
++      if(ex){Object.assign(ex,fields);updated++}
++      else{D.items.push(Object.assign({id:uid(),priority:'normal',reminders:[],done:false,created:Date.now(),list:null},fields));added++}
++    });
++    D.settings.lastPull=Date.now();save();
++    if(added||updated)render();
++    if(!silent)toast('Google → FlowState: '+added+' new, '+updated+' updated');
++  }catch(e){if(!silent)toast('Pull failed: '+e.message)}
+ }
+ function connectGoogleSync(){
++  if(!gsReady()){toast('Add your sync URL in Settings first');return}
+   D.settings.googleSync=true;save();
+   const pending=D.items.slice();
+   pending.forEach(item=>sendGoogleSync('upsert',item));
+   render();toast('Google sync requests sent for '+pending.length+' items');
++  pullGoogleSync(true);
+ }
+ function disconnectGoogleSync(){
+   D.settings.googleSync=false;save();render();toast('Automatic Google sync paused');
+ }
+ function testGoogleSync(){
+-  if(!D.settings.googleSync){toast('Connect Google sync first');return}
+-  const body=JSON.stringify({token:GOOGLE_SYNC_TOKEN,action:'test'});
+-  fetch(GOOGLE_SYNC_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=UTF-8'},body,keepalive:true})
+-    .then(()=>toast('Test request sent. Check your Gmail inbox for the FlowState test email.'))
++  if(!gsReady()){toast('Add your sync URL in Settings first');return}
++  const body=JSON.stringify({key:gsKey(),action:'test'});
++  fetch(gsUrl(),{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=UTF-8'},body,keepalive:true})
++    .then(()=>toast('Test request sent. Check your Google account for the FlowState test event.'))
+     .catch(()=>toast('Could not send the test request. Check your connection.'));
+ }
++function setSync(field,value){
++  D.settings[field]=value;save();
++}
+ window.addEventListener('online',flushGoogleSync);
+ function clsName(id){const c=D.classes.find(x=>x.id===id);return c?c.name:''}
+ function sheet(h){$('#sheetBody').innerHTML=h;$('#sheet').classList.add('on')}
+@@ -263,7 +480,8 @@ function render(){
+   applyStyle();rail();
+   const t=S.tab,v=$('#view');
+   v.className=S.enter?'enter':'';S.enter=false;
+-  v.innerHTML=t==='home'?viewHome():t==='school'?(S.cls?viewClass(S.cls):viewClassSelect()):t==='personal'?viewPersonal():t==='notifs'?viewNotifs():t==='settings'?viewSettings():viewCat(t);
++  v.innerHTML=t==='home'?viewHome():t==='school'?(S.cls?viewClass(S.cls):viewClassSelect()):t==='personal'?viewPersonal():t==='notifs'?viewNotifs():t==='settings'?viewSettings():t==='browser'?viewBrowser():t==='focus'?viewFocus():viewCat(t);
++  if(t!=='settings'&&t!=='notifs'&&t!=='browser'&&t!=='focus'){const w=widgetHtml();if(w)v.insertAdjacentHTML('afterbegin',w)}
+   bind(v);
+   $('#schoolBtn').classList.toggle('on',t==='school'&&!!S.cls);
+   if(t==='school'&&!S.cls&&S.bubble)showBubble();else hideBubble();
+@@ -272,7 +490,7 @@ function render(){
+ }
+ function updateBell(){const n=D.notifs.filter(x=>!x.read).length;$('#badge').textContent=n||''}
+ 
+-const card=i=>`<div class="card${i.done?' done':''}" data-item="${i.id}">${['homework','test','bucket','project'].includes(i.type)?`<button class="chk" onclick="toggleDone('${i.id}')">${i.done?'✓':''}</button>`:''}<div class="grow"><b>${esc(i.title)}</b><small>${i.due?esc(fmt(i.due))+' · ':''}${esc(LABEL[i.type]||'')}${i.cls?' · '+esc(clsName(i.cls)):''}${i.priority==='high'?' · 🔴 High priority':i.priority==='low'?' · Low priority':''}</small></div></div>`;
++const card=i=>`<div class="card${i.done?' done':''}" data-item="${i.id}">${['homework','test','bucket','project'].includes(i.type)?`<button class="chk" onclick="toggleDone('${i.id}')">${i.done?'✓':''}</button>`:''}<div class="grow"><b>${esc(i.title)}</b><small>${i.due?esc(fmt(i.due))+' · ':''}${esc(LABEL[i.type]||'')}${i.cls?' · '+esc(clsName(i.cls)):''}${i.priority==='high'?' · 🔴 High priority':i.priority==='low'?' · Low priority':''}${recActive(i)?' · 🔁 '+esc(recSummary(i)):''}${i.source==='google'?' · 📅 Google':''}</small></div></div>`;
+ const list=a=>a.length?a.map(card).join(''):'<p class="empty">Nothing here yet. Tap + to add.</p>';
+ 
+ function viewHome(){
+@@ -282,11 +500,12 @@ function viewHome(){
+   const overdue=D.items.filter(i=>!i.done&&i.due&&new Date(i.due).getTime()<now).sort((a,b)=>new Date(a.due)-new Date(b.due));
+   const todayItems=D.items.filter(i=>!i.done&&i.due&&dk(new Date(i.due))===dk(new Date())).sort((a,b)=>new Date(a.due)-new Date(b.due));
+   const soon=D.items.filter(i=>(i.type==='homework'||i.type==='test')&&!i.done&&i.due&&(new Date(i.due)-now)>-864e5&&(new Date(i.due)-now)<6048e5).sort((a,b)=>new Date(a.due)-new Date(b.due));
+-  const counts={};D.items.forEach(i=>{if(i.due){const k=dk(new Date(i.due));counts[k]=(counts[k]||0)+1}});
++  const mStart=new Date(m.getFullYear(),m.getMonth(),1),mEnd=new Date(m.getFullYear(),m.getMonth()+1,0,23,59,59);
++  const counts={};expandRange(mStart,mEnd).forEach(o=>{counts[o.key]=(counts[o.key]||0)+1});
+   const today=dk(new Date());
+   let cells='';for(let i=0;i<first;i++)cells+='<div></div>';
+   for(let d=1;d<=days;d++){const k=dk(new Date(m.getFullYear(),m.getMonth(),d));cells+=`<button class="day${k===today?' today':''}${k===S.sel?' sel':''}" onclick="selDay('${k}')">${d}${counts[k]?`<i>${counts[k]}</i>`:''}</button>`}
+-  const dayItems=D.items.filter(i=>i.due&&dk(new Date(i.due))===S.sel).sort((a,b)=>new Date(a.due)-new Date(b.due));
++  const dayItems=itemsOnDay(S.sel);
+   return `<div class="home"><div class="sticky-col">
+     <div class="sticky"><h3>Recent Notes</h3>${list(notes)}</div>
+     <div class="sticky"><h3>Recent Recordings</h3>${list(recs)}</div>
+@@ -296,7 +515,9 @@ function viewHome(){
+     <div class="cal"><div class="calhead"><button onclick="moveMonth(-1)">‹</button><b>${m.toLocaleString([],{month:'long',year:'numeric'})}</b><button onclick="toggleView()">${S.view==='week'?'Month':'Week'}</button><button onclick="moveMonth(1)">›</button></div>
+     <div class="wk">${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d=>`<span>${d}</span>`).join('')}</div>
+     ${S.view==='week'?weekGrid():`<div class="days">${cells}</div>`}
+-    <h3 class="dl">${new Date(S.sel+'T00:00').toDateString()}</h3><div class="dayList">${list(dayItems)}</div></div></div>`;
++    <h3 class="dl">${new Date(S.sel+'T00:00').toDateString()}</h3>
++    <div class="row"><button class="chip primary" onclick="openDayAdd('event')" title="Add an event on this date">+ Event</button><button class="chip" onclick="openDayAdd('homework')" title="Add homework due this date">+ Task</button><button class="chip" onclick="openDayAdd('note')" title="Add a note for this date">+ Note</button><button class="chip" onclick="openDayAdd('event',1)" title="Add an event with a reminder">+ Reminder</button></div>
++    <div class="dayList">${list(dayItems)}</div></div></div>`;
+ }
+ function selDay(k){S.sel=k;render()}
+ function moveMonth(n){
+@@ -324,15 +545,85 @@ function setBgImg(file,k){
+ }
+ 
+ function viewClassSelect(){
+-  return `<h1>Classes</h1><p class="empty">Tap a class for quick options. Hold a class to open its tab.</p>
+-  <div class="grid">${D.classes.map(c=>`<div class="blob${S.bubble&&S.bubble!==c.id?' pushed':''}" data-cls="${c.id}" style="background:${c.color};width:${Math.round((c.size||1)*100)}%;justify-self:center"><span class="ico">${clsIco(c)}</span><b>${esc(c.name)}</b></div>`).join('')}</div>`;
++  const cs=[...D.classes].sort((a,b)=>(a.order==null?999:a.order)-(b.order==null?999:b.order));
++  return `<h1>Classes</h1><p class="empty">Tap a book to open it. Hold a book to jump to its tab. Use the arrows to rearrange, ⚙ to customize.</p>
++  <div class="books">${cs.map(c=>bookCard(c)).join('')}</div>
++  <div class="row"><button class="primary" onclick="openForm('class')">+ Add class</button></div>`;
++}
++function bookCard(c){
++  const b=c.book||{};const tint=b.tint||c.color;
++  const counts=D.items.filter(i=>i.cls===c.id).length;
++  const st=(b.stickers||[]).map(s=>`<span style="left:${s.x}%;top:${s.y}%;font-size:${s.s||26}px">${esc(s.e)}</span>`).join('');
++  return `<div class="book" data-cls="${c.id}" style="background:${tint}">
++    ${b.cover?`<img class="cover" src="${b.cover}" alt="">`:'<div class="shade"></div>'}
++    <div class="spine"></div>
++    <div class="stickers">${st}</div>
++    <div class="bcount" title="${counts} items">${counts}</div>
++    <div class="bico">${c.img?`<img src="${c.img}" alt="">`:esc(c.icon)}</div>
++    <div class="bmeta"><b>${esc(c.name)}</b><small>${esc(b.subtitle||'')}</small></div>
++    <div class="reorder">
++      <button onclick="event.stopPropagation();moveBook('${c.id}',-1)" title="Move left">◀</button>
++      <button onclick="event.stopPropagation();editBook('${c.id}')" title="Customize this book">⚙</button>
++      <button onclick="event.stopPropagation();moveBook('${c.id}',1)" title="Move right">▶</button>
++    </div></div>`;
++}
++function moveBook(id,dir){
++  const cs=[...D.classes].sort((a,b)=>(a.order==null?999:a.order)-(b.order==null?999:b.order));
++  const i=cs.findIndex(c=>c.id===id),j=i+dir;
++  if(i<0||j<0||j>=cs.length)return;
++  const t=cs[i];cs[i]=cs[j];cs[j]=t;
++  cs.forEach((c,k)=>{c.order=k});save();render();
++}
++function editBook(id){
++  const c=D.classes.find(x=>x.id===id);if(!c)return;
++  c.book=c.book||{cover:null,tint:null,stickers:[],subtitle:''};
++  BOOKID=id;
++  const st=(c.book.stickers||[]).map((s,i)=>`<span class="chip">${esc(s.e)} <button onclick="delSticker(${i})">×</button></span>`).join('');
++  sheet(`<h2>Customize “${esc(c.name)}”</h2>
++  <label>Custom title <input id="bk-title" value="${esc(c.name)}"></label>
++  <label>Subtitle <input id="bk-sub" placeholder="e.g. Period 3" value="${esc(c.book.subtitle||'')}"></label>
++  <label>Cover image <input type="file" accept="image/*" onchange="pickBookCover(this.files[0])"></label>
++  <div class="row"><button onclick="c.book.cover=null;save();closeSheet();render()">Remove cover</button></div>
++  <label>Cover colour <input type="color" value="${c.book.tint||c.color}" onchange="c.book.tint=this.value;save();render()"></label>
++  <label>Add sticker or emoji <input id="bk-st" placeholder="🎧 or 📚" maxlength="4" onkeydown="if(event.key==='Enter')addSticker()"></label>
++  <div class="row"><button onclick="addSticker()">Add sticker</button>${st}</div>
++  <p class="empty">Stickers appear at random spots on the cover. Tap Add sticker again to reposition.</p>
++  <div class="row"><button class="primary" onclick="saveBook()">Save</button><button onclick="closeSheet()">Cancel</button></div>`);
++}
++function pickBookCover(f){
++  if(!f)return;const c=D.classes.find(x=>x.id===BOOKID);if(!c)return;
++  const r=new FileReader();
++  r.onload=()=>{const im=new Image();im.onload=()=>{
++    const mx=560,sc=Math.min(1,mx/Math.max(im.width,im.height));
++    const cv=document.createElement('canvas');cv.width=Math.round(im.width*sc);cv.height=Math.round(im.height*sc);
++    cv.getContext('2d').drawImage(im,0,0,cv.width,cv.height);
++    c.book.cover=cv.toDataURL('image/jpeg',0.72);save();toast('Cover saved');
++  };im.src=r.result};
++  r.readAsDataURL(f);
++}
++function addSticker(){
++  const c=D.classes.find(x=>x.id===BOOKID);const el=$('#bk-st');if(!c||!el)return;
++  const e=el.value.trim();if(!e)return;
++  c.book.stickers=c.book.stickers||[];
++  c.book.stickers.push({e,x:10+Math.round(Math.random()*70),y:10+Math.round(Math.random()*55),s:22+Math.round(Math.random()*14)});
++  el.value='';save();editBook(BOOKID);
++}
++function delSticker(i){
++  const c=D.classes.find(x=>x.id===BOOKID);if(!c)return;
++  c.book.stickers.splice(i,1);save();editBook(BOOKID);
++}
++function saveBook(){
++  const c=D.classes.find(x=>x.id===BOOKID);if(!c)return;
++  const t=val('title').trim();if(t)c.name=t;
++  c.book.subtitle=val('sub').trim();
++  save();closeSheet();render();
+ }
+ function viewClass(id){
+   const c=D.classes.find(x=>x.id===id);if(!c){S.cls=null;return viewClassSelect()}
+   const sums=D.items.filter(i=>i.type==='summary'&&i.cls===id).sort(byC);
+   const hw=D.items.filter(i=>(i.type==='homework'||i.type==='test')&&i.cls===id).sort((a,b)=>new Date(a.due||0)-new Date(b.due||0));
+   return `<h1>${esc(c.icon)} ${esc(c.name)}</h1><div class="cols">
+-    <div class="panel tall"><h3>Recent Class Summary</h3>${sums[0]?card(sums[0])+`<div class="body">${esc(sums[0].body)}</div>`:'<p class="empty">No summaries yet.</p>'}</div>
++    <div class="panel tall"><h3>Recent Class Summary</h3>${sums[0]?card(sums[0])+bodyHtml(sums[0].body,'cs-'+sums[0].id):'<p class="empty">No summaries yet.</p>'}</div>
+     <div class="stack"><div class="panel"><h3>Previous Summaries</h3>${list(sums.slice(1))}</div>
+     <div class="panel"><h3>Homework + Studying</h3><div class="row"><button class="primary" onclick="openFocus()">Focus timer</button></div>${list(hw)}</div></div></div>`;
+ }
+@@ -341,7 +632,7 @@ function viewCat(c){
+   const proj=D.items.filter(i=>i.type==='project'&&i.cat===c).sort(byC);
+   const n=CATS[c];
+   return `<h1>${n}</h1><div class="cols">
+-    <div class="panel tall"><h3>Recent ${n} Summary</h3>${sums[0]?card(sums[0])+`<div class="body">${esc(sums[0].body)}</div>`:'<p class="empty">No summaries yet.</p>'}</div>
++    <div class="panel tall"><h3>Recent ${n} Summary</h3>${sums[0]?card(sums[0])+bodyHtml(sums[0].body,'ct-'+sums[0].id):'<p class="empty">No summaries yet.</p>'}</div>
+     <div class="stack"><div class="panel"><h3>Previous Summaries</h3>${list(sums.slice(1))}</div>
+     <div class="panel"><h3>${c==='work'?'Current Projects':'Meetings and Events'}</h3>${list(proj)}</div></div></div>`;
+ }
+@@ -376,10 +667,18 @@ function viewSettings(){
+     <label>Style <select onchange="setS('anim',this.value)">${Object.entries(ANIMS).map(([k,l])=>`<option value="${k}" ${(s.anim||'bubbles')===k?'selected':''}>${l}</option>`).join('')}</select></label>
+     <label>Speed <input type="range" min="0" max="3" step="0.1" value="${s.speed}" onchange="setS('speed',+this.value)"></label>
+     <label><input type="checkbox" ${s.reduce?'checked':''} onchange="setS('reduce',this.checked)"> Reduce motion (stops the blobs)</label></div>
+-  <div class="panel"><h3>Google integration</h3>
+-    <p class="empty">${D.settings.googleSync?'Google sync is enabled on this device.':'Connect FlowState to send your items to Google Calendar and receive scheduled Gmail reminders.'}</p>
+-    <div class="row">${D.settings.googleSync?'<button class="primary" onclick="connectGoogleSync()">Sync all items now</button><button onclick="testGoogleSync()">Send test email</button><button onclick="disconnectGoogleSync()">Pause sync</button>':'<button class="primary" onclick="connectGoogleSync()">Connect Google &amp; sync items</button>'}</div>
+-    <small>Only items created or changed on this device are sent. Keep this app connected to the internet when making changes. Calendar and email delivery are handled by your Google Apps Script.</small>
++  <div class="panel"><h3>Google Calendar sync</h3>
++    <p class="empty">${gsReady()?'Connected to your own sync endpoint.':'Add the Apps Script web app URL you deployed from your own Google account. No endpoint or key is built into this app.'}</p>
++    <label>Sync URL <input id="f-gsurl" value="${esc(gsUrl())}" placeholder="https://script.google.com/macros/s/…/exec" title="Your Apps Script web app URL"></label>
++    <label>Device key <input id="f-gskey" type="password" value="${esc(gsKey())}" placeholder="Private key set in your script" title="Stored only on this device"></label>
++    <div class="row"><button onclick="saveSyncSettings()" title="Keep these on this device">Save</button>${D.settings.googleSync?'<button class="primary" onclick="connectGoogleSync()" title="Push everything, then pull changes">Sync all items</button><button onclick="pullGoogleSync()" title="Bring Google Calendar events in">Pull from Google</button><button onclick="testGoogleSync()">Send test</button><button onclick="disconnectGoogleSync()">Pause</button>':'<button class="primary" onclick="connectGoogleSync()" title="Push everything, then pull changes">Connect &amp; sync</button>'}</div>
++    <small>Events you create sync out. Events you add in Google Calendar sync in and are tagged 📅 Google. Matching uses the Google event id, so nothing is duplicated. If you ever used a built-in endpoint from an older version, delete that deployment in Apps Script and generate a new key.</small>
++  </div>
++  <div class="panel"><h3>AI transcript summaries</h3>
++    <p class="empty">Optional. Point this at your own summarization endpoint. The key is stored on this device only and is never written into the app.</p>
++    <label>Endpoint <input id="f-aiurl" value="${esc(D.settings.aiUrl||'')}" placeholder="https://your-endpoint" title="Your summarization endpoint"></label>
++    <label>Key <input id="f-aikey" type="password" value="${esc(D.settings.aiKey||'')}" placeholder="Stored only on this device" title="Your API key"></label>
++    <div class="row"><button onclick="saveAiSettings()" title="Save on this device">Save</button></div>
+   </div>
+   <div class="panel"><h3>Backup</h3><div class="row"><button onclick="exportData()">Export data</button><button onclick="importData()">Import data</button></div></div>
+   <div class="panel"><h3>Classes</h3>${D.classes.map(c=>`<div class="card"><div class="grow">${esc(c.icon)} ${esc(c.name)}</div><button onclick="editClass('${c.id}')">Edit</button> <button class="danger" onclick="delClass('${c.id}')">Delete</button></div>`).join('')}
+@@ -387,6 +686,214 @@ function viewSettings(){
+ }
+ function setS(k,v){const s=D.settings;if(k.startsWith('bg.'))s.bg[k.slice(3)]=v;else s[k]=v;save();render()}
+ 
++/* ================= recurrence form helpers ================= */
++function recUI(){
++  const f=$('#r-freq');if(!f)return;
++  const v=f.value;
++  if($('#r-week'))$('#r-week').style.display=v==='weekly'?'':'none';
++  if($('#r-month'))$('#r-month').style.display=v==='monthly'?'':'none';
++  const mm=$('#r-mmode');
++  if($('#r-nth'))$('#r-nth').style.display=(v==='monthly'&&mm&&mm.value==='nth')?'':'none';
++}
++function readRecurrence(){
++  const f=$('#r-freq');if(!f)return null;
++  const freq=f.value;if(freq==='none')return null;
++  const r={freq:freq,interval:Math.max(1,parseInt(val('r-int'),10)||1),until:val('r-until')||null,count:parseInt(val('r-count'),10)||0};
++  if(freq==='weekly')r.weekdays=[...document.querySelectorAll('.r-wd')].filter(x=>x.checked).map(x=>+x.value);
++  if(freq==='monthly'){
++    r.monthlyMode=val('r-mmode')||'day';
++    if(r.monthlyMode==='nth'){r.nth=parseInt(val('r-n'),10)||1;r.nthWeekday=parseInt(val('r-nwd'),10)||0}
++  }
++  return r;
++}
++
++/* ================= schedule templates ================= */
++function saveAsTemplate(id){
++  const i=D.items.find(x=>x.id===id);if(!i)return;
++  D.templates=D.templates||[];
++  D.templates.push({id:uid(),name:i.title,type:i.type,cat:i.cat,cls:i.cls,body:i.body||'',recurrence:i.recurrence?JSON.parse(JSON.stringify(i.recurrence)):null,priority:i.priority,reminders:(i.reminders||[]).slice()});
++  save();closeSheet();toast('Saved as a schedule template');
++}
++function templateSheet(){
++  const t=D.templates||[];
++  sheet('<h2>Schedule templates</h2><p class="empty">Reusable routines for work, school and everything else.</p>'+
++    (t.length?t.map(x=>'<div class="card"><div class="grow"><b>'+esc(x.name)+'</b><small>'+esc(recSummary(x)||LABEL[x.type]||'Template')+(x.cls?' · '+esc(clsName(x.cls)):'')+'</small></div><button onclick="useTemplate(\''+x.id+'\')" title="Create an item from this template">Use</button><button class="danger" onclick="delTemplate(\''+x.id+'\')" title="Delete template">✕</button></div>').join(''):'<p class="empty">No templates yet. Open an event or task and choose “Save as template”.</p>'));
++}
++function useTemplate(id){
++  const t=(D.templates||[]).find(x=>x.id===id);if(!t)return;
++  openForm(t.type);
++  setTimeout(function(){
++    const set=function(sel,v){const e=$(sel);if(e!=null)e.value=v};
++    set('#f-title',t.name);set('#f-body',t.body||'');
++    if(t.cls)set('#f-cls',t.cls);
++    if(t.cat)set('#f-cat',t.cat);
++    if($('#r-freq')){$('#r-freq').value=(t.recurrence&&t.recurrence.freq)||'none';recUI()}
++    toast('Template loaded — pick a date and save');
++  },30);
++}
++function delTemplate(id){D.templates=(D.templates||[]).filter(x=>x.id!==id);save();templateSheet()}
++
++/* ================= built-in browser ================= */
++function viewBrowser(){
++  const bm=D.bookmarks||[];
++  return '<h1>Browser</h1><p class="empty">Saved websites. “Open” uses the in-app browser on your tablet; “External” opens your normal browser for sites that block embedding or need unsupported sign-in.</p>'+
++    '<div class="row"><input id="f-url" placeholder="example.com" style="flex:1" title="Website address"><input id="f-name" placeholder="Name (optional)" style="width:10em" title="Shortcut name"><button class="primary" onclick="addBookmark()" title="Save this website as a shortcut">+ Save</button></div>'+
++    '<div class="cols">'+(bm.length?bm.map(b=>'<div class="panel"><h3>'+esc(b.name)+'</h3><small>'+esc(b.url)+'</small><div class="row"><button class="primary" onclick="openUrl(\''+esc(b.url)+'\',0)" title="Open inside FlowState">Open</button><button onclick="openUrl(\''+esc(b.url)+'\',1)" title="Open in your normal browser">External</button><button class="danger" onclick="delBookmark(\''+b.id+'\')" title="Remove shortcut">Delete</button></div></div>').join(''):'<p class="empty">No saved websites yet.</p>')+'</div>';
++}
++function addBookmark(){
++  let u=val('url').trim();if(!u)return toast('Enter a website address');
++  if(!/^https?:\/\//i.test(u))u='https://'+u;
++  const n=val('name').trim()||u.replace(/^https?:\/\//,'').split('/')[0];
++  D.bookmarks=D.bookmarks||[];D.bookmarks.push({id:uid(),name:n,url:u});save();render();
++}
++function delBookmark(id){D.bookmarks=(D.bookmarks||[]).filter(b=>b.id!==id);save();render()}
++function openUrl(u,external){
++  const isAndroid=/Android/i.test(navigator.userAgent);
++  if(external||!isAndroid){window.open(u,'_blank','noopener');return}
++  window.location.href='flowstate://browse?url='+encodeURIComponent(u);
++}
++
++/* ================= decorative widgets + image library ================= */
++const QUOTES=[
++  'Small steps, every day, become a different life.',
++  'You do not have to be extreme, just consistent.',
++  'Discipline is choosing what you want most over what you want now.',
++  'Start where you are. Use what you have. Do what you can.',
++  'The work you avoid is usually the work that matters.',
++  'Progress hides in the days you feel like quitting.',
++  'One page, one problem, one hour at a time.',
++  'Rest is part of the plan, not a break from it.'
++];
++const SCENES={
++  'Mountain dawn':['#f7b267','#f4845f','#fff3b0'],
++  'Ocean calm':['#3a86ff','#4cc9f0','#ffffff'],
++  'Forest trail':['#2d6a4f','#40916c','#d8f3dc'],
++  'City dusk':['#3d405b','#e07a5f','#f4f1de'],
++  'Desert sun':['#e76f51','#f4a261','#ffe8d6'],
++  'Night sky':['#14213d','#1b263b','#e0e1dd']
++};
++function sceneUrl(name){
++  const p=SCENES[name]||SCENES['Mountain dawn'];
++  const svg='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 240"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="'+p[0]+'"/><stop offset="1" stop-color="'+p[1]+'"/></linearGradient></defs><rect width="400" height="240" fill="url(#g)"/><circle cx="312" cy="56" r="24" fill="'+p[2]+'" opacity="0.85"/><path d="M0 176 L70 104 L130 158 L196 92 L268 168 L330 120 L400 178 L400 240 L0 240 Z" fill="#000" opacity="0.28"/><path d="M0 206 L96 152 L170 200 L250 148 L330 198 L400 172 L400 240 L0 240 Z" fill="#000" opacity="0.38"/></svg>';
++  return 'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg);
++}
++let WSEED=0;
++function widgetCfg(){const w=D.settings.widget||{};return {on:!!w.on,size:w.size||'m',rotate:w.rotate||'tab',cols:w.collections||['scenic','quote']}}
++function widgetPool(){
++  const c=widgetCfg(),p=[];
++  if(c.cols.includes('scenic'))Object.keys(SCENES).forEach(k=>p.push({t:'img',src:sceneUrl(k),label:k}));
++  if(c.cols.includes('user'))(D.images||[]).forEach(im=>p.push({t:'img',src:im.src,label:im.name||'My image'}));
++  if(c.cols.includes('quote'))QUOTES.forEach(q=>p.push({t:'quote',txt:q,label:'Daily inspiration'}));
++  return p;
++}
++function widgetIndex(n){
++  const c=widgetCfg();
++  if(c.rotate==='daily'){const d=new Date();return Math.floor(new Date(d.getFullYear(),d.getMonth(),d.getDate()).getTime()/864e5)%n}
++  const tabs=Object.keys(CATS);return (WSEED+tabs.indexOf(S.tab)+3)%n;
++}
++function widgetHtml(){
++  const c=widgetCfg();if(!c.on)return '';
++  const p=widgetPool();if(!p.length)return '';
++  const it=p[widgetIndex(p.length)];
++  const h=c.size==='s'?120:c.size==='l'?300:190;
++  const inner=it.t==='quote'?'<div class="wq">“'+esc(it.txt)+'”</div>':'<img src="'+it.src+'" alt="'+esc(it.label)+'"><span class="wlab">'+esc(it.label)+'</span>';
++  return '<div class="widget" style="height:'+h+'px">'+inner+'<button class="wref" onclick="refreshWidget()" title="Show another image or quote">⟳</button></div>';
++}
++function refreshWidget(){WSEED++;render();toast('Refreshed')}
++function addImages(files){
++  [...files].forEach(f=>{
++    const r=new FileReader();
++    r.onload=function(){
++      const im=new Image();
++      im.onload=function(){
++        const mx=560,sc=Math.min(1,mx/Math.max(im.width,im.height));
++        const cv=document.createElement('canvas');
++        cv.width=Math.round(im.width*sc)||1;cv.height=Math.round(im.height*sc)||1;
++        cv.getContext('2d').drawImage(im,0,0,cv.width,cv.height);
++        D.images=D.images||[];
++        D.images.push({id:uid(),name:f.name.replace(/\.[^.]+$/,''),src:cv.toDataURL('image/jpeg',0.72)});
++        save();render();toast('Image added to your library');
++      };
++      im.src=r.result;
++    };
++    r.readAsDataURL(f);
++  });
++}
++function delImage(id){D.images=(D.images||[]).filter(x=>x.id!==id);save();render()}
++function setWidget(k,v){D.settings.widget=D.settings.widget||{};D.settings.widget[k]=v;save();render()}
++function toggleWidgetCol(v,on){
++  const c=widgetCfg();let cols=c.cols.slice();
++  if(on&&!cols.includes(v))cols.push(v);
++  if(!on)cols=cols.filter(x=>x!==v);
++  setWidget('collections',cols);
++}
++function lookSheet(){
++  const c=widgetCfg();const imgs=D.images||[];
++  sheet('<h2>Look &amp; widgets</h2>'+
++    '<div class="panel"><h3>Decorative widget</h3>'+
++    '<label class="chip"><input type="checkbox" '+(c.on?'checked':'')+' onchange="setWidget(\'on\',this.checked)" title="Show a decorative widget on category pages"> Show widget</label>'+
++    '<div class="row"><span>Size</span>'+['s','m','l'].map(s=>'<label class="chip"><input type="radio" name="wsz" '+(c.size===s?'checked':'')+' onchange="setWidget(\'size\',\''+s+'\')" title="Widget size"> '+(s==='s'?'Small':s==='m'?'Medium':'Large')+'</label>').join('')+'</div>'+
++    '<div class="row"><span>Change</span>'+[['tab','When I open a tab'],['daily','Daily']].map(o=>'<label class="chip"><input type="radio" name="wrot" '+(c.rotate===o[0]?'checked':'')+' onchange="setWidget(\'rotate\',\''+o[0]+'\')" title="When images change"> '+o[1]+'</label>').join('')+'</div>'+
++    '<div class="row"><label class="chip"><input type="checkbox" '+(c.cols.includes('scenic')?'checked':'')+' onchange="toggleWidgetCol(\'scenic\',this.checked)" title="Scenic artwork"> Scenic artwork</label>'+
++    '<label class="chip"><input type="checkbox" '+(c.cols.includes('quote')?'checked':'')+' onchange="toggleWidgetCol(\'quote\',this.checked)" title="Motivational quotes"> Quotes</label>'+
++    '<label class="chip"><input type="checkbox" '+(c.cols.includes('user')?'checked':'')+' onchange="toggleWidgetCol(\'user\',this.checked)" title="My uploaded images"> My images</label></div>'+
++    '<div class="row"><button onclick="refreshWidget()" title="Show another now">Refresh now</button></div></div>'+
++    '<div class="panel"><h3>My image library</h3><p class="empty">Stored on this device, so they stay available offline.</p>'+
++    '<div class="row"><input type="file" accept="image/*" multiple onchange="addImages(this.files)" title="Add images from this device"></div>'+
++    '<div class="books" style="grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px">'+
++    (imgs.length?imgs.map(im=>'<div style="position:relative"><img src="'+im.src+'" alt="'+esc(im.name||'')+'" style="width:100%;height:86px;object-fit:cover;border-radius:10px"><button class="danger" style="position:absolute;top:4px;right:4px;width:28px;height:28px;padding:0;border-radius:50%" onclick="delImage(\''+im.id+'\')" title="Remove image">✕</button></div>').join(''):'<p class="empty">No images yet.</p>')+'</div></div>'+
++    '<div class="panel"><h3>Schedule templates</h3><button onclick="closeSheet();templateSheet()" title="Open templates">Open templates</button></div>');
++}
++
++/* ================= global search ================= */
++function openSearch(){
++  sheet('<h2>Search</h2><input id="f-q" placeholder="Notes, recordings, assignments, events, bookmarks" oninput="liveSearch(this.value)" title="Type to search everything"><div id="qres"><p class="empty">Type to search across your whole app.</p></div>');
++  setTimeout(function(){const q=$('#f-q');if(q)q.focus()},60);
++}
++function searchAll(q){
++  q=(q||'').toLowerCase().trim();if(!q)return [];
++  const out=[];
++  (D.items||[]).forEach(function(i){
++    const hay=(i.title+' '+(i.body||'')+' '+(LABEL[i.type]||'')+' '+(i.cls?clsName(i.cls):'')).toLowerCase();
++    if(hay.indexOf(q)>=0)out.push({kind:'item',id:i.id,title:i.title,sub:(LABEL[i.type]||'')+(i.cls?' · '+clsName(i.cls):'')+(i.due?' · '+fmt(i.due):'')});
++  });
++  (D.bookmarks||[]).forEach(function(b){
++    if((b.name+' '+b.url).toLowerCase().indexOf(q)>=0)out.push({kind:'bm',url:b.url,title:b.name,sub:'Bookmark · '+b.url});
++  });
++  (D.images||[]).forEach(function(im){
++    if((im.name||'').toLowerCase().indexOf(q)>=0)out.push({kind:'img',title:im.name||'Image',sub:'My image library'});
++  });
++  return out.slice(0,60);
++}
++function liveSearch(q){
++  const r=searchAll(q),box=$('#qres');if(!box)return;
++  box.innerHTML=r.length?r.map(function(x){
++    const act=x.kind==='item'?'closeSheet();openDetail(\''+x.id+'\')':x.kind==='bm'?'openUrl(\''+esc(x.url)+'\',0)':'closeSheet();lookSheet()';
++    return '<div class="card" onclick="'+act+'"><div class="grow"><b>'+esc(x.title)+'</b><small>'+esc(x.sub)+'</small></div></div>';
++  }).join(''):'<p class="empty">Nothing found.</p>';
++}
++
++/* ================= focus mode ================= */
++function viewFocus(){
++  const next=(D.items||[]).filter(i=>!i.done&&i.due).sort((a,b)=>new Date(a.due)-new Date(b.due))[0];
++  const today=(D.items||[]).filter(i=>!i.done&&i.due&&dk(i.due)===dk(new Date()));
++  return '<h1>Focus mode</h1><p class="empty">Distractions are hidden. One thing at a time.</p>'+
++    (next?'<div class="panel"><h3>Next up</h3><b>'+esc(next.title)+'</b><small>'+esc(fmt(next.due))+'</small><div class="row"><button class="primary" onclick="openDetail(\''+next.id+'\')" title="Open this item">Open</button><button onclick="toggleDone(\''+next.id+'\')" title="Mark complete">Done</button></div></div>':'<p class="empty">Nothing scheduled. Enjoy the space.</p>')+
++    '<p class="empty">Today: '+today.length+' open item'+(today.length===1?'':'s')+'.</p>'+
++    '<div class="row"><button onclick="go2(\'home\')" title="Leave focus mode">Leave focus mode</button></div>';
++}
++
++/* ================= universal quick add ================= */
++function quickAdd(){
++  sheet('<h2>Quick add</h2><p class="empty">What would you like to add?</p>'+
++    '<div class="row"><button class="primary" onclick="closeSheet();openDayAdd(\'event\')" title="Add an event">📅 Event</button>'+
++    '<button onclick="closeSheet();openDayAdd(\'homework\')" title="Add a task">✅ Task</button>'+
++    '<button onclick="closeSheet();openDayAdd(\'note\')" title="Add a note">📝 Note</button>'+
++    '<button onclick="closeSheet();openDayAdd(\'reminder\')" title="Add a reminder">⏰ Reminder</button></div>'+
++    '<div class="row"><button onclick="closeSheet();templateSheet()" title="Use a schedule template">🔁 From template</button>'+
++    '<button onclick="closeSheet();go2(\'browser\')" title="Save a website">🌐 Bookmark</button></div>');
++}
++
+ function hold(el,tap,long){
+   let t,fired=false,skip=false;
+   el.addEventListener('pointerdown',e=>{skip=!!e.target.closest('button');fired=false;clearTimeout(t);t=setTimeout(()=>{fired=true;long()},500)});
+@@ -462,7 +969,27 @@ function openForm(type,id,pre={}){
+     <option value="low" ${v.priority==='low'?'selected':''}>Low</option>
+   </select></label>
+   <div><b>Remind me before:</b><br>${[5,10,15,20,30,60].map(m=>`<label class="chip"><input type="checkbox" class="rem" value="${m}" ${rem.includes(m)?'checked':''}> ${m} min</label>`).join('')}</div>
+-  <input id="f-custom" placeholder="Custom minutes, e.g. 45, 90">`:''}
++  <input id="f-custom" placeholder="Custom minutes, e.g. 45, 90">
++  ${(()=>{const r=v.recurrence||{freq:'none'};const iv=r.interval||1;const wd=r.weekdays||[];const mm=r.monthlyMode||'day';
++    const opt=(val2,lab,cur)=>`<option value="${val2}" ${String(cur)===String(val2)?'selected':''}>${lab}</option>`;
++    return `<div class="recbox"><b>Repeat</b>
++    <label>Frequency <select id="r-freq" onchange="recUI()">
++      ${opt('none','Does not repeat',r.freq)}${opt('daily','Daily',r.freq)}${opt('weekly','Weekly',r.freq)}${opt('monthly','Monthly',r.freq)}${opt('yearly','Yearly',r.freq)}
++    </select></label>
++    <div id="r-week" style="display:${r.freq==='weekly'?'':'none'}"><b>On these days</b><div class="row">${WDAYS.map((d,ix)=>`<label class="chip"><input type="checkbox" class="r-wd" value="${ix}" ${wd.includes(ix)?'checked':''}> ${d}</label>`).join('')}</div></div>
++    <div id="r-month" style="display:${r.freq==='monthly'?'':'none'}">
++      <label>Pattern <select id="r-mmode" onchange="recUI()">
++        ${opt('day','Same date each month',mm)}${opt('nth','Nth weekday of the month',mm)}
++      </select></label>
++      <div id="r-nth" style="display:${(r.freq==='monthly'&&mm==='nth')?'':'none'}" class="row">
++        <select id="r-n">${[1,2,3,4,5].map(n=>opt(n,['1st','2nd','3rd','4th','5th'][n-1],r.nth||1)).join('')}</select>
++        <select id="r-nwd">${WDAYS.map((d,ix)=>opt(ix,d,r.nthWeekday==null?5:r.nthWeekday)).join('')}</select>
++      </div>
++    </div>
++    <label>Every <input id="r-int" type="number" min="1" value="${iv}" style="width:5em"> interval(s)</label>
++    <label>Ends on (optional) <input id="r-until" type="date" value="${r.until||''}"></label>
++    <label>Or stop after <input id="r-count" type="number" min="0" placeholder="times" value="${r.count||''}" style="width:7em"></label>
++    </div>`})()}`:''}
+   ${isText?`<textarea id="f-body" placeholder="${type==='summary'?'Paste the meeting summary here':'Write here'}">${esc(v.body)}</textarea>`:''}
+   <div class="row"><button class="primary" onclick="saveForm()">Save</button><button onclick="closeSheet()">Cancel</button>${ex?`<button class="danger" onclick="delItem('${ex.id}')">Delete</button>`:''}</div>`);
+ }
+@@ -471,7 +998,7 @@ function saveForm(){
+   const ex=FORM.id&&D.items.find(i=>i.id===FORM.id),T=FORM.type;
+   const rem=[...document.querySelectorAll('.rem:checked')].map(x=>+x.value).concat(val('custom').split(',').map(s=>parseInt(s,10))).filter(n=>n>0);
+   const cat=val('cat');
+-  const it={id:ex?ex.id:uid(),type:T,cat,cls:(cat==='school'&&val('cls'))||null,title:val('title').trim()||LABEL[T],body:val('body'),due:val('due')||null,list:T==='bucket'?val('list'):null,priority:['low','normal','high'].includes(val('priority'))?val('priority'):'normal',reminders:[...new Set(rem)],done:ex?ex.done:false,created:ex?ex.created:Date.now()};
++  const it={id:ex?ex.id:uid(),type:T,cat,cls:(cat==='school'&&val('cls'))||null,title:val('title').trim()||LABEL[T],body:val('body'),due:val('due')||null,list:T==='bucket'?val('list'):null,priority:['low','normal','high'].includes(val('priority'))?val('priority'):'normal',reminders:[...new Set(rem)],done:ex?ex.done:false,created:ex?ex.created:Date.now(),recurrence:readRecurrence(),exceptions:ex?(ex.exceptions||[]):[],source:ex?(ex.source||'flowstate'):'flowstate',gcalId:ex?ex.gcalId||null:null,gcalCal:ex?ex.gcalCal||null:null};
+   if(ex)Object.assign(ex,it);else D.items.push(it);
+   save();sendGoogleSync('upsert',it);closeSheet();render();
+ }
+@@ -502,13 +1029,17 @@ function confirmSheet(msg,fn){CONF=fn;sheet(`<p>${esc(msg)}</p><div class="row">
+ 
+ function openDetail(id){
+   const i=D.items.find(x=>x.id===id);if(!i)return;
+-  sheet(`<small>${esc(LABEL[i.type]||'')}${i.cat?' · '+CATS[i.cat]:''}${i.cls?' · '+esc(clsName(i.cls)):''}</small>
++  const rec=recActive(i);
++  sheet(`<small>${esc(LABEL[i.type]||'')}${i.cat?' · '+CATS[i.cat]:''}${i.cls?' · '+esc(clsName(i.cls)):''}${i.source==='google'?' · 📅 '+esc(i.gcalCal||'Google Calendar'):''}</small>
+   <h2>${esc(i.title)}</h2>
+   ${i.due?`<p>Due ${esc(fmt(i.due))}</p>`:''}
++  ${rec?`<p>🔁 ${esc(recSummary(i))}</p>`:''}
+   ${i.reminders&&i.reminders.length?`<p>Reminders: ${i.reminders.join(', ')} min before</p>`:''}
+   ${i.duration?`<p>Length: ${fmtDur(i.duration*1000)}</p>`:''}
+-  <div class="body">${esc(i.body)}</div>
+-  <div class="row">${i.type==='recording'?'':`<button onclick="openForm(null,'${id}')">Edit</button>`}${i.due?`<button onclick="icsFor('${id}')">Calendar file</button>`:''}<button class="danger" onclick="delItem('${id}')">Delete</button><button onclick="closeSheet()">Close</button></div>`);
++  ${bodyHtml(i.body,'dt-'+i.id)}
++  ${i.audio&&i.audio.url?`<audio controls preload="metadata" src="${esc(i.audio.url)}" style="width:100%;margin:8px 0"></audio>`:''}
++  <div class="row">${i.type==='recording'?`<button onclick="summarizeRecording('${id}')" title="Summarize the transcript and pull out tasks">Summarize</button>`:`<button onclick="openForm(null,'${id}')">Edit</button>`}${i.due?`<button onclick="icsFor('${id}')">Calendar file</button>`:''}<button onclick="saveAsTemplate('${id}')" title="Reuse this as a routine">Save as template</button><button class="danger" onclick="delItem('${id}')">Delete</button><button onclick="closeSheet()">Close</button></div>
++  ${rec?`<div class="row"><button onclick="editOccurrence('${id}')" title="Change only one date, leaving the rest of the series">Edit one occurrence</button><button onclick="skipThis('${id}')" title="Skip one date but keep the series">Skip next</button><button class="danger" onclick="delSeries('${id}')" title="Delete every occurrence">Delete series</button></div>`:''}`);
+ }
+ function delItem(id){
+   const i=D.items.findIndex(x=>x.id===id);if(i<0)return;
+@@ -518,6 +1049,40 @@ function delItem(id){
+ }
+ function toggleDone(id){const i=D.items.find(x=>x.id===id);if(i){i.done=!i.done;save();sendGoogleSync('upsert',i);render()}}
+ 
++/* ================= recurring series editing ================= */
++function nextOccDate(i){
++  if(S.sel&&occursOnDate(i,S.sel))return S.sel;
++  const t=new Date();
++  for(let k=0;k<400;k++){const x=new Date(t);x.setDate(t.getDate()+k);if(occursOnDate(i,x))return dk(x)}
++  return null;
++}
++function skipThis(id){
++  const i=D.items.find(x=>x.id===id);if(!i||!recActive(i))return;
++  const d=nextOccDate(i);if(!d)return toast('No upcoming occurrence found');
++  skipOccurrence(id,d);closeSheet();render();toast('Skipped '+fmt(d)+' — the series continues');
++}
++function delSeries(id){
++  const i=D.items.find(x=>x.id===id);if(!i)return;
++  D.items=D.items.filter(x=>x.id!==id);save();sendGoogleSync('delete',null,id);closeSheet();render();
++  toast('Series deleted');
++}
++function editOccurrence(id){
++  const i=D.items.find(x=>x.id===id);if(!i||!recActive(i))return;
++  const d=nextOccDate(i);if(!d)return toast('No upcoming occurrence found');
++  const o=occAt(i,d);
++  skipOccurrence(id,d);
++  const copy=JSON.parse(JSON.stringify(i));
++  copy.id=uid();copy.recurrence=null;copy.exceptions=[];copy.gcalId=null;copy.source='local';
++  copy.due=dk(o)+'T'+String(o.getHours()).padStart(2,'0')+':'+String(o.getMinutes()).padStart(2,'0');
++  D.items.push(copy);save();closeSheet();openForm(null,copy.id);
++  toast('Editing just this occurrence');
++}
++function saveSyncSettings(){
++  D.settings.gsUrl=val('gsurl').trim();
++  D.settings.gsKey=val('gskey').trim();
++  save();render();toast('Sync settings saved on this device');
++}
++
+ function openRec(){
+   if(REC)return showRec();
+   sheet(`<h2>Quick recording</h2><p>Where should this go?</p>
+@@ -704,7 +1269,62 @@ function frame(){
+ }
+ 
+ window.addEventListener('resize',resize);
+-resize();rail_init();clock();render();tick();flushGoogleSync();
++/* ================= shared recordings from Android ================= */
++function androidBridge(){return (typeof FlowStateAndroid!=='undefined')?FlowStateAndroid:null}
++function checkSharedImports(){
++  const b=androidBridge();if(!b||!b.pendingImports)return;
++  let list=[];
++  try{list=JSON.parse(b.pendingImports()||'[]')}catch(e){return}
++  if(!list||!list.length)return;
++  importSheet(list);
++}
++function importSheet(list){
++  window.__pendingImports=list;
++  sheet('<h2>Import shared items</h2><p class="empty">These were copied into FlowState storage, so they stay available after the sharing app closes.</p>'+
++    list.map(f=>'<div class="card"><div class="grow"><b>'+esc(f.name||'Shared item')+'</b><small>'+esc(f.mime||'file')+' · '+Math.max(1,Math.round((f.size||0)/1024))+' KB</small>'+(f.text?'<small>'+esc(String(f.text).slice(0,160))+'…</small>':'')+'</div></div>').join('')+
++    '<label>Put them in <select id="f-impcat" title="Category for these recordings">'+Object.keys(CATS).map(k=>'<option value="'+k+'"'+(k==='personal'?' selected':'')+'>'+esc(CATS[k])+'</option>').join('')+'</select></label>'+
++    '<div class="row"><button class="primary" onclick="doImport()" title="Save into FlowState">Import</button><button onclick="dismissImports()" title="Discard these files">Discard</button></div>');
++}
++function doImport(){
++  const b=androidBridge();const list=window.__pendingImports||[];if(!list.length)return closeSheet();
++  const cat=val('impcat')||'personal';
++  list.forEach(function(f){
++    D.items.push({id:uid(),type:'recording',cat:cat,cls:null,title:f.name||'Recording',body:f.text||'',due:null,list:null,priority:'normal',reminders:[],done:false,created:Date.now(),source:'share',audio:{url:f.url||'',name:f.name||'',mime:f.mime||'',size:f.size||0}});
++    if(b&&b.clearPending)b.clearPending(f.id);
++  });
++  window.__pendingImports=[];save();closeSheet();render();
++  toast(list.length+' item'+(list.length===1?'':'s')+' imported');
++}
++function dismissImports(){
++  const b=androidBridge();(window.__pendingImports||[]).forEach(function(f){if(b&&b.clearPending)b.clearPending(f.id)});
++  window.__pendingImports=[];closeSheet();
++}
++function saveAiSettings(){
++  D.settings.aiUrl=val('aiurl').trim();D.settings.aiKey=val('aikey').trim();
++  save();render();toast('AI settings saved on this device');
++}
++function summarizeRecording(id){
++  const i=D.items.find(x=>x.id===id);if(!i)return;
++  const url=String(D.settings.aiUrl||'').trim(),key=String(D.settings.aiKey||'').trim();
++  if(!url)return toast('Add an AI endpoint in Settings first');
++  if(!i.body)return toast('This recording has no transcript text to summarize');
++  toast('Summarizing…');
++  fetch(url,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+key},body:JSON.stringify({text:i.body,title:i.title})})
++    .then(r=>r.json())
++    .then(function(j){
++      const s=j.summary||j.text||'';
++      const tasks=j.tasks||[];
++      i.body=(i.body?i.body+'\n\n':'')+'— Summary —\n'+s;
++      (tasks||[]).forEach(function(t){
++        D.items.push({id:uid(),type:'homework',cat:i.cat,cls:i.cls,title:(t.title||String(t)),body:'',due:t.due||null,list:null,priority:'normal',reminders:[],done:false,created:Date.now(),source:'ai'});
++      });
++      save();closeSheet();render();
++      toast('Summary saved'+(tasks.length?' · '+tasks.length+' task'+(tasks.length===1?'':'s')+' added':''));
++    })
++    .catch(function(){toast('Could not reach the AI endpoint')});
++}
++
++resize();rail_init();clock();render();tick();flushGoogleSync();checkSharedImports();
+ setInterval(tick,15000);setInterval(clock,1000);
+ requestAnimationFrame(frame);
+ </script>
+diff --git a/sw.js b/sw.js
+index a64fd38..db46438 100644
+--- a/sw.js
++++ b/sw.js
+@@ -1,4 +1,4 @@
+-const CACHE_NAME = 'flowstate-v3';
++const CACHE_NAME = 'flowstate-v4';
+ const APP_SHELL = [
+   './',
+   './index.html',
