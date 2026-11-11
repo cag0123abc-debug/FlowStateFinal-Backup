@@ -238,11 +238,11 @@ const byC=(a,b)=>b.created-a.created;
 const val=k=>$('#f-'+k)?.value??'';
 const CATS={home:'Home',school:'School',work:'Work',deyc:'DEYC',personal:'Personal'};
 const BGK=['home','school','work','deyc','personal'];
-const RAIL=[['home','🏠','Home'],['school','🎓','School'],['work','💼','Work'],['deyc','🤝','DEYC'],['personal','🌟','Personal']];
+const RAIL=[['home','🏠','Home'],['school','🎓','School'],['work','💼','Work'],['deyc','🤝','DEYC'],['personal','🌟','Personal'],['browser','🌐','Browser']];
 const LISTS=['Must Watch','Must Read','Must Play','To Do','Websites','Potential Ideas','Games to Play'];
 const LABEL={event:'Event',homework:'Homework',test:'Test',summary:'Summary',project:'Project',note:'Note',bucket:'List item',recording:'Recording'};
 const WDAYS=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-let FORM={},REC=null,RC='school',CCOL=PAL[0],UNDO=null,TT=null,CONF=null;
+let FORM={},REC=null,RC='school',CCOL=PAL[0],UNDO=null,TT=null,CONF=null,BOOKID=null;
 S.sel=dk(new Date());
 S.month=new Date(new Date().getFullYear(),new Date().getMonth(),1);
 
@@ -767,6 +767,7 @@ function openForm(type,id,pre={}){
   <div class="row"><button class="primary" onclick="saveForm()">Save</button><button onclick="closeSheet()">Cancel</button>${ex?`<button class="danger" onclick="delItem('${ex.id}')">Delete</button>`:''}</div>`);
 }
 function saveForm(){
+  if(FORM.type==='class')return saveClass();
   const ex=FORM.id&&D.items.find(i=>i.id===FORM.id),T=FORM.type;
   const rem=[...document.querySelectorAll('.rem:checked')].map(x=>+x.value).concat(val('custom').split(',').map(s=>parseInt(s,10))).filter(n=>n>0);
   const cat=val('cat');
